@@ -2056,6 +2056,11 @@ def run_tui(check=False, scene="fire", dock=False):
         old_attrs = termios.tcgetattr(fd)
         tty.setcbreak(fd)
     sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+    if dock and interactive:
+        # match the sibling pane's mouse mode: if panes disagree, tmux
+        # toggles outer mouse tracking on every redraw and the pointer
+        # strobes between arrow and I-beam
+        sys.stdout.write("\x1b[?1002;1006h")
 
     frame = 0
     last_cols = cols
@@ -2132,6 +2137,8 @@ def run_tui(check=False, scene="fire", dock=False):
                 elif ch == "b":
                     mon.demo()
     finally:
+        if dock and interactive:
+            sys.stdout.write("\x1b[?1002;1006l")
         sys.stdout.write(RESET + "\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
         if old_attrs is not None:
