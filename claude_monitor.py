@@ -1655,6 +1655,8 @@ class Monitor:
         self.smoke = []
         self.mound = []
         self.embers = []
+        self.pills = []               # tokens lobbed into the flames
+        self._pill_acc = 0.0
         self.prev_pct = None
 
     def resize(self, fire_rows):
@@ -1682,7 +1684,22 @@ class Monitor:
     # ---- scene interface --------------------------------------------------
 
     def frame(self):
-        return self.pixels(), None, []
+        overlay = {}
+        for p in self.pills:
+            row = int(p["y"] // 2)
+            if not 0 <= row < self.rows:
+                continue
+            if p["burn"] is None:
+                bg, fg = p["color"], T_INK
+            else:
+                k = clamp((self.t - p["burn"]) / 0.3, 0.0, 1.0)
+                bg = lerp3((255, 230, 160), (200, 60, 10), k)
+                fg = lerp3((90, 30, 10), (255, 240, 200), k)
+            for i, ch in enumerate(p["text"]):
+                cx = int(p["x"]) + i
+                if 0 <= cx < WIDTH:
+                    overlay[(row, cx)] = (ch, fg, bg)
+        return self.pixels(), overlay or None, []
 
     def status_line(self, gauges):
         if self.state in ("dying", "ash"):
@@ -1781,9 +1798,63 @@ class Monitor:
                 self.heat = 0.1
                 self.state = "normal"
 
+        # we are burning tokens as we speak: throw them in
+        if self.state in ("normal", "dying"):
+            intensity = clamp(max(rate / 2.0, 0.55 if busy else 0.0),
+                              0.04, 1.0)
+            self._update_pills(intensity if self.state == "normal" else 0.0)
+        elif self.pills:
+            self.pills = []
+
         if self.state in ("normal", "reignite"):
             self.prev_pct = pct
         self._update_smoke()
+
+    def _update_pills(self, intensity):
+        H = self.fire.h
+        t = self.t
+        if intensity > 0.06:
+            self._pill_acc += self.dt * (0.3 + 1.5 * intensity)
+            if self._pill_acc >= 1.0 and len(self.pills) < 6:
+                self._pill_acc = 0.0
+                side = random.choice((-1, 1))
+                text = random.choice(("t", "o", "k", "e", "n",
+                                      "to", "ok", "en", "tok", "ken"))
+                self.pills.append({
+                    "text": text,
+                    "color": PASTELS[random.randrange(len(PASTELS))],
+                    "x": -float(len(text)) if side > 0 else float(WIDTH),
+                    "y": H * random.uniform(0.18, 0.42),
+                    "vx": side * random.uniform(13.0, 21.0),
+                    "vy": -random.uniform(4.0, 12.0),
+                    "burn": None})
+        keep = []
+        for p in self.pills:
+            if p["burn"] is None:
+                p["vy"] += 26.0 * self.dt
+                p["x"] += p["vx"] * self.dt
+                p["y"] += p["vy"] * self.dt
+                cx = int(clamp(p["x"] + len(p["text"]) / 2, 0, WIDTH - 1))
+                cy = int(clamp(p["y"], 0, H - 1))
+                if p["y"] >= H - 2 or self.fire.cells[cy][cx] > 11:
+                    p["burn"] = t                     # caught fire
+                    for dx in range(-1, len(p["text"]) + 1):
+                        fx = int(p["x"]) + dx         # fuel: the fire flares
+                        if 0 <= fx < WIDTH:
+                            for dy in (0, 1, 2):
+                                fy = min(H - 1, cy + dy)
+                                self.fire.cells[fy][fx] = min(
+                                    MAXHEAT, self.fire.cells[fy][fx] + 24)
+                    for _ in range(2):
+                        self.sparks.append(
+                            [p["x"] + random.uniform(0, len(p["text"])),
+                             p["y"] - 1.0, -random.uniform(14.0, 26.0),
+                             0.0, random.uniform(0.3, 0.6)])
+                keep.append(p)
+            elif t - p["burn"] < 0.3:
+                p["y"] += 6.0 * self.dt               # sinks as it burns
+                keep.append(p)
+        self.pills = keep
 
     def _reignite_step(self, heat, p):
         fire = self.fire
