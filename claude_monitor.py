@@ -22,6 +22,8 @@ Usage:
   claude_monitor.py [--scene fire|tokens|invaders] [--fps N]
   claude_monitor.py side [cmd...]   split: monitor docks right (tmux),
                                     cmd (default: your shell) runs left
+  claude_monitor.py window          open in its own terminal window
+                                    (zero interference with your cursor)
   claude_monitor.py --once          fetch usage once, print, exit
   claude_monitor.py --check         headless render smoke test
 
@@ -2056,11 +2058,6 @@ def run_tui(check=False, scene="fire", dock=False):
         old_attrs = termios.tcgetattr(fd)
         tty.setcbreak(fd)
     sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
-    if dock and interactive:
-        # match the sibling pane's mouse mode: if panes disagree, tmux
-        # toggles outer mouse tracking on every redraw and the pointer
-        # strobes between arrow and I-beam
-        sys.stdout.write("\x1b[?1002;1006h")
 
     frame = 0
     last_cols = cols
@@ -2137,8 +2134,6 @@ def run_tui(check=False, scene="fire", dock=False):
                 elif ch == "b":
                     mon.demo()
     finally:
-        if dock and interactive:
-            sys.stdout.write("\x1b[?1002;1006l")
         sys.stdout.write(RESET + "\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
         if old_attrs is not None:
@@ -2193,6 +2188,28 @@ def run_side(cmd, scene="fire"):
     sys.exit("side mode needs tmux (apt/dnf/brew install tmux)")
 
 
+def run_window(scene):
+    """Own terminal window: no shared cursor with your work = no flicker."""
+    self_args = [sys.executable, os.path.abspath(__file__)]
+    if scene != "fire":
+        self_args += ["--scene", scene]
+    if FPS != 28:
+        self_args += ["--fps", str(FPS)]
+    if shutil.which("gnome-terminal"):
+        subprocess.Popen(["gnome-terminal", "--geometry", f"{WIDTH}x50",
+                          "--"] + self_args)
+    elif shutil.which("kitty"):
+        subprocess.Popen(["kitty", "-o", "remember_window_size=no",
+                          "-o", f"initial_window_width={WIDTH}c",
+                          "-o", "initial_window_height=50c"] + self_args)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-a", "Terminal",
+                          os.path.abspath(__file__)])
+    else:
+        sys.exit("window mode needs gnome-terminal or kitty")
+    print("monitor opened in its own window — snap it aside with Super+arrow")
+
+
 def main():
     argv = sys.argv[1:]
     scene = "fire"
@@ -2222,6 +2239,8 @@ def main():
         run_tui(check=True, scene=scene)
     elif argv and argv[0] == "side":
         run_side(argv[1:], scene)
+    elif argv and argv[0] == "window":
+        run_window(scene)
     else:
         run_tui(scene=scene, dock=dock)
 
