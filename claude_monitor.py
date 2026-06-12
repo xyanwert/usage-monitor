@@ -1817,16 +1817,15 @@ class Monitor:
             self._pill_acc += self.dt * (0.3 + 1.5 * intensity)
             if self._pill_acc >= 1.0 and len(self.pills) < 6:
                 self._pill_acc = 0.0
-                side = random.choice((-1, 1))
                 text = random.choice(("t", "o", "k", "e", "n",
                                       "to", "ok", "en", "tok", "ken"))
-                self.pills.append({
+                self.pills.append({       # rain down from the sky
                     "text": text,
                     "color": PASTELS[random.randrange(len(PASTELS))],
-                    "x": -float(len(text)) if side > 0 else float(WIDTH),
-                    "y": H * random.uniform(0.18, 0.42),
-                    "vx": side * random.uniform(13.0, 21.0),
-                    "vy": -random.uniform(4.0, 12.0),
+                    "x": random.uniform(2.0, WIDTH - 2.0 - len(text)),
+                    "y": -2.0,
+                    "vx": random.uniform(-2.5, 2.5),
+                    "vy": random.uniform(2.0, 9.0),
                     "burn": None})
         keep = []
         for p in self.pills:
