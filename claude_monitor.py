@@ -19,11 +19,15 @@ real countdown; the march panics as the fleet thins, the formation sinks
 as the window elapses, and a saucer crosses when fresh data lands).
 
 Usage:
-  claude_monitor.py [--scene fire|tokens|invaders]
+  claude_monitor.py [--scene fire|tokens|invaders] [--fps N]
   claude_monitor.py side [cmd...]   split: monitor docks right (tmux),
                                     cmd (default: your shell) runs left
   claude_monitor.py --once          fetch usage once, print, exit
   claude_monitor.py --check         headless render smoke test
+
+Frames are wrapped in DEC 2026 synchronized updates, so on terminals that
+support it (kitty, Ghostty, iTerm2, WezTerm, recent VTE) the sibling pane's
+cursor doesn't flicker. On older terminals, lower --fps (e.g. 12) to tame it.
 
 Keys:  s  switch scene (fire / tokenfall)       r  refresh now
        t  toggle "resets at" / "time until"     q  quit
@@ -2071,7 +2075,11 @@ def run_tui(check=False, scene="fire", dock=False):
                 sess_next = time.monotonic() + 2.0
             busy = bool(sess and sess.get("status") == "busy")
             mon.update(gauges, rate, busy)
-            sys.stdout.write(render(mon, gauges, plan, age, error, rate, sess))
+            # DEC 2026 synchronized update: terminals that support it apply
+            # the frame atomically — no cursor hide/show flicker in siblings
+            sys.stdout.write("\x1b[?2026h"
+                             + render(mon, gauges, plan, age, error, rate,
+                                      sess) + "\x1b[?2026l")
             sys.stdout.flush()
             frame += 1
 
@@ -2145,8 +2153,13 @@ def run_side(cmd, scene="fire"):
                 f"{shlex.quote(os.path.abspath(__file__))} --dock")
     if scene != "fire":
         self_cmd += f" --scene {shlex.quote(scene)}"
+    if FPS != 28:
+        self_cmd += f" --fps {FPS}"
     inner = cmd or [os.environ.get("SHELL", "bash")]
+    sync_override = ",*:Sync=\\E[?2026%?%p1%{1}%=%th%el%;"
     if os.environ.get("TMUX"):
+        subprocess.run(["tmux", "set-option", "-as", "terminal-overrides",
+                        sync_override], stderr=subprocess.DEVNULL)
         out = subprocess.run(["tmux", "split-window", "-h", "-l", str(WIDTH),
                               "-d", "-P", "-F", "#{pane_id}", self_cmd],
                              check=True, capture_output=True, text=True)
@@ -2160,7 +2173,8 @@ def run_side(cmd, scene="fire"):
         os.execvp("tmux", [
             "tmux", "new-session", f"{inner_str}; tmux kill-session", ";",
             "split-window", "-h", "-l", str(WIDTH), "-d", self_cmd, ";",
-            "set-option", "mouse", "on",
+            "set-option", "mouse", "on", ";",
+            "set-option", "-as", "terminal-overrides", sync_override,
         ])
     if shutil.which("gnome-terminal"):
         subprocess.Popen(["gnome-terminal", "--geometry",
@@ -2185,6 +2199,14 @@ def main():
     dock = "--dock" in argv
     if dock:
         argv.remove("--dock")
+    if "--fps" in argv:
+        i = argv.index("--fps")
+        try:
+            global FPS
+            FPS = clamp(int(argv[i + 1]), 5, 60)
+        except (IndexError, ValueError):
+            sys.exit("--fps needs a number (5-60)")
+        del argv[i:i + 2]
     if argv and argv[0] in ("-h", "--help"):
         print(__doc__.strip())
     elif argv and argv[0] == "--once":
