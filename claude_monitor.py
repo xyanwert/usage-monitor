@@ -2003,7 +2003,7 @@ def gauge_rows_for(gauges):
     return len(gauges) if gauges else 3
 
 
-def run_tui(check=False, scene="fire"):
+def run_tui(check=False, scene="fire", dock=False):
     try:
         read_creds()
     except Exception as e:
@@ -2054,6 +2054,7 @@ def run_tui(check=False, scene="fire"):
     sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
 
     frame = 0
+    last_cols = cols
     sess, sess_next = None, 0.0
     try:
         next_t = time.monotonic()
@@ -2075,11 +2076,20 @@ def run_tui(check=False, scene="fire"):
             frame += 1
 
             if frame % 28 == 0:
-                _, nrows = shutil.get_terminal_size((80, 32))
+                ncols, nrows = shutil.get_terminal_size((80, 32))
+                # a dock pane keeps itself at 44 cols: when the terminal
+                # jumps displays/sizes, tmux regrows panes proportionally
+                if dock and ncols != WIDTH and os.environ.get("TMUX_PANE"):
+                    subprocess.run(
+                        ["tmux", "resize-pane", "-t",
+                         os.environ["TMUX_PANE"], "-x", str(WIDTH)],
+                        stderr=subprocess.DEVNULL)
                 want = max(10, nrows - 3 - gauge_rows_for(gauges)) \
                     - (1 if mon is tok else 0)
-                if want != mon.rows:
-                    mon.resize(want)
+                if want != mon.rows or ncols != last_cols:
+                    if want != mon.rows:
+                        mon.resize(want)
+                    last_cols = ncols
                     sys.stdout.write("\x1b[2J")
 
             if not interactive:
@@ -2131,7 +2141,8 @@ def run_once():
 
 
 def run_side(cmd, scene="fire"):
-    self_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
+    self_cmd = (f"{shlex.quote(sys.executable)} "
+                f"{shlex.quote(os.path.abspath(__file__))} --dock")
     if scene != "fire":
         self_cmd += f" --scene {shlex.quote(scene)}"
     inner = cmd or [os.environ.get("SHELL", "bash")]
@@ -2171,6 +2182,9 @@ def main():
             sys.exit("--scene needs 'fire', 'tokens' or 'invaders'")
         scene = argv[i + 1]
         del argv[i:i + 2]
+    dock = "--dock" in argv
+    if dock:
+        argv.remove("--dock")
     if argv and argv[0] in ("-h", "--help"):
         print(__doc__.strip())
     elif argv and argv[0] == "--once":
@@ -2180,7 +2194,7 @@ def main():
     elif argv and argv[0] == "side":
         run_side(argv[1:], scene)
     else:
-        run_tui(scene=scene)
+        run_tui(scene=scene, dock=dock)
 
 
 if __name__ == "__main__":
