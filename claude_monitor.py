@@ -16,10 +16,13 @@ on reset the whole archive avalanches away) and INVADERS (your quota is
 a fleet — every token you burn shoots one down, so "winning" means
 hitting the rate limit: GAME OVER, then reinforcements beam in on the
 real countdown; the march panics as the fleet thins, the formation sinks
-as the window elapses, and a saucer crosses when fresh data lands).
+as the window elapses, and a saucer crosses when fresh data lands) and
+CUBE (a real 3D Rubik's cube, perspective-projected and light-shaded:
+burning quota scrambles it one layer-turn per ~1.5%, and while you wait
+for reset it solves itself — finishing exactly when the window resets).
 
 Usage:
-  claude_monitor.py [--scene fire|tokens|invaders] [--fps N]
+  claude_monitor.py [--scene fire|tokens|invaders|cube] [--fps N]
   claude_monitor.py side [cmd...]   split: monitor docks right (tmux),
                                     cmd (default: your shell) runs left
   claude_monitor.py window          open in its own terminal window
@@ -1201,6 +1204,262 @@ class WaterScene:
         return g["pct"]
 
 
+# ---- cube scene -----------------------------------------------------------
+CUBE_COLS = {
+    (0, 0, 1): (236, 236, 236),   # up: white
+    (0, 0, -1): (250, 208, 60),   # down: yellow
+    (0, 1, 0): (40, 150, 215),    # back: blue
+    (0, -1, 0): (60, 175, 90),    # front: green
+    (1, 0, 0): (215, 65, 55),     # right: red
+    (-1, 0, 0): (245, 130, 45),   # left: orange
+}
+
+
+def _rotax(p, ax, ang):
+    """Rotate point p around axis ax (0/1/2) by ang radians (right-handed)."""
+    c, s = math.cos(ang), math.sin(ang)
+    x, y, z = p
+    if ax == 0:
+        return (x, y * c - z * s, y * s + z * c)
+    if ax == 1:
+        return (x * c + z * s, y, -x * s + z * c)
+    return (x * c - y * s, x * s + y * c, z)
+
+
+def _rot90(p, ax, d):
+    x, y, z = p
+    if ax == 0:
+        return (x, -d * z, d * y)
+    if ax == 1:
+        return (d * z, y, -d * x)
+    return (-d * y, d * x, z)
+
+
+def _fill_quad(buf, pts, color, W2, H):
+    """Scanline-fill a convex quad given four projected (x, y) corners."""
+    ys = [p[1] for p in pts]
+    y0, y1 = max(0, int(min(ys))), min(H - 1, int(max(ys)))
+    for y in range(y0, y1 + 1):
+        yc = y + 0.5
+        xs = []
+        for i in range(4):
+            (xa, ya), (xb, yb) = pts[i], pts[(i + 1) % 4]
+            if (ya <= yc) != (yb <= yc):
+                xs.append(xa + (yc - ya) * (xb - xa) / (yb - ya))
+        if len(xs) >= 2:
+            xs.sort()
+            for x in range(max(0, int(xs[0] + 0.5)),
+                           min(W2, int(xs[-1] + 0.5))):
+                buf[y][x] = color
+
+
+class CubeScene:
+    """CUBE: a real 3D Rubik's cube. Burning quota scrambles it, one move
+    per ~1.5%; while you wait for reset it solves itself (replaying its own
+    scramble backwards), finishing exactly when the window resets."""
+
+    N_MOVES = 66                      # fully scrambled at 100%
+
+    def __init__(self, client, rows):
+        self.client = client
+        self.rows = rows
+        self.t = 0.0
+        self.dt = 1.0 / FPS
+        self.state = "normal"         # normal | out (scrambled flat-line)
+        self.demo_until = None
+        self.view_mode = "auto"
+        self._intensity = 0.05
+        self._pct = None
+        self._out_len = 0
+        self._restore_prog = 0.0
+        # stickers: cubelet position, outward normal, color
+        self.stickers = []
+        for n, col in CUBE_COLS.items():
+            ax = n.index(next(c for c in n if c))
+            u, v = [i for i in range(3) if i != ax]
+            for a in (-1, 0, 1):
+                for b in (-1, 0, 1):
+                    p = [0, 0, 0]
+                    p[ax], p[u], p[v] = n[ax], a, b
+                    self.stickers.append([tuple(p), n, col])
+        self.history = []             # applied scramble moves
+        self.move = None              # (ax, layer, dir, t0, dur, undo)
+        self._yaw = 0.7
+
+    def resize(self, rows):
+        self.rows = rows
+
+    def demo(self):
+        if self.state == "normal" and self.demo_until is None:
+            self.demo_until = self.t + DEMO_BURNOUT_SECS + 4.0
+
+    def _start_move(self, ax, layer, d, dur, undo):
+        self.move = (ax, layer, d, self.t, dur, undo)
+
+    def _finish_move(self):
+        ax, layer, d, _, _, undo = self.move
+        for s in self.stickers:
+            if s[0][ax] == layer:
+                s[0] = _rot90(s[0], ax, d)
+                s[1] = _rot90(s[1], ax, d)
+        if undo:
+            self.history.pop()
+        else:
+            self.history.append((ax, layer, d))
+        self.move = None
+
+    # ---- per-frame --------------------------------------------------------
+
+    def update(self, gauges, rate, busy=False):
+        self.t += self.dt
+        t = self.t
+        ses = next((g for g in gauges if g["key"] == "five_hour"), None)
+        pct = ses["pct"] if ses else None
+        resets = ses["resets"] if ses else None
+        self._pct = pct
+        self._intensity = clamp(max(rate / 2.0, 0.55 if busy else 0.0),
+                                0.04, 1.0)
+        demo = self.demo_until is not None
+        if demo and t >= self.demo_until:
+            self.demo_until = None
+            demo = False
+            self.state = "normal"
+        self._yaw += self.dt * ((0.10 if self.state == "out" else 0.35)
+                                + 0.5 * self._intensity)
+
+        # state machine + scramble target (same reconcile as the others)
+        if demo:
+            dt_demo = t - (self.demo_until - DEMO_BURNOUT_SECS - 4.0)
+            if dt_demo < 4.0:
+                self.state, target = "normal", 16
+            elif dt_demo < 5.5:
+                self.state, target = "out", len(self.history)
+            else:
+                self.state, target = "out", 0
+        elif self.state == "normal":
+            self.client.hot = pct is not None and pct >= 92
+            target = (0 if pct is None
+                      else round(clamp(pct, 0, 100) / 100.0 * self.N_MOVES))
+            if pct is not None and pct >= 99.5:
+                self.state = "out"
+                self._out_len = len(self.history)
+        else:                          # out: solve in step with the countdown
+            if resets is not None:
+                secs = (resets - datetime.now(timezone.utc)).total_seconds()
+                self._restore_prog = clamp(1.0 - secs / 18000.0, 0.0, 1.0)
+                self.client.hot = secs < 120
+                if secs <= 0:
+                    self.client.force()
+            else:
+                self._restore_prog = min(0.95, self._restore_prog
+                                         + 0.01 * self.dt)
+                self.client.hot = True
+            target = round((1.0 - self._restore_prog) * self._out_len)
+            if pct is not None and pct < 99.5:
+                self.client.hot = False
+                self.state = "normal"
+
+        # animate one layer turn at a time; cadence scales with backlog
+        if self.move is not None:
+            ax, layer, d, t0, dur, undo = self.move
+            if t - t0 >= dur:
+                self._finish_move()
+        if self.move is None:
+            gap = target - len(self.history)
+            if gap != 0:
+                dur = clamp(0.55 / (1.0 + abs(gap) * 0.2), 0.12, 0.55)
+                if gap > 0:
+                    ax = random.randrange(3)
+                    layer = random.choice((-1, 0, 1))
+                    d = random.choice((-1, 1))
+                    if self.history and (ax, layer, -d) == self.history[-1]:
+                        d = -d            # don't immediately undo yourself
+                    self._start_move(ax, layer, d, dur, undo=False)
+                elif self.history:
+                    ax, layer, d = self.history[-1]
+                    self._start_move(ax, layer, -d, dur, undo=True)
+
+    # ---- scene interface --------------------------------------------------
+
+    def frame(self):
+        H = self.rows * 2
+        W2 = WIDTH * 2
+        t = self.t
+        buf = [[(7, 7, 9)] * W2 for _ in range(H)]
+        yaw, pitch = self._yaw, -0.42 + 0.18 * math.sin(t * 0.23)
+        dim = self.state == "out"
+        mv = self.move
+        prog = 0.0
+        if mv is not None:
+            ax_m, layer_m, d_m, t0, dur, _ = mv
+            k = clamp((t - t0) / dur, 0.0, 1.0)
+            prog = (k * k * (3 - 2 * k)) * (math.pi / 2) * d_m
+
+        def view(p):
+            return _rotax(_rotax(p, 1, yaw), 0, pitch)
+
+        light = (0.36, 0.48, 0.80)
+        sy = min(H * 0.128, 6.6)      # fit the 88px width on tall panes too
+        quads = []
+        for pos, n, col in self.stickers:
+            moving = mv is not None and pos[ax_m] == layer_m
+            ax = n.index(next(c for c in n if c))
+            u, v = [i for i in range(3) if i != ax]
+            corners3 = []
+            for du, dv in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+                c3 = [float(pos[0]), float(pos[1]), float(pos[2])]
+                c3[ax] += n[ax] * 0.5
+                c3[u] += du * 0.5
+                c3[v] += dv * 0.5
+                if moving:
+                    c3 = _rotax(c3, ax_m, prog)
+                corners3.append(view(tuple(c3)))
+            nv = view(_rotax(n, ax_m, prog) if moving else n)
+            if nv[2] <= 0.02:
+                continue
+            shade = 0.42 + 0.58 * max(0.0, nv[0] * light[0]
+                                      + nv[1] * light[1] + nv[2] * light[2])
+            c = tuple(int(ch * shade) for ch in col)
+            if dim:                    # burnout: the colors drain out
+                g = (c[0] * 3 + c[1] * 5 + c[2] * 2) // 10
+                c = (g, g, int(g * 1.05))
+            plastic = tuple(int(22 * shade) + 6 for _ in range(3))
+            zmid = sum(p[2] for p in corners3) / 4.0
+            quads.append((zmid, corners3, plastic, c))
+
+        cx, cy = W2 / 2.0, H / 2.0
+        for zmid, corners3, plastic, c in sorted(quads, key=lambda q: q[0]):
+            pts = []
+            for x, y, z in corners3:
+                f = 5.5 / (5.5 - z * 0.55)
+                pts.append((cx + x * sy * 2.0 * f, cy - y * sy * f))
+            _fill_quad(buf, pts, plastic, W2, H)
+            ctr = (sum(p[0] for p in pts) / 4.0, sum(p[1] for p in pts) / 4.0)
+            inset = [(px + (ctr[0] - px) * 0.18, py + (ctr[1] - py) * 0.18)
+                     for px, py in pts]
+            _fill_quad(buf, inset, c, W2, H)
+        return buf, None, []
+
+    def status_line(self, gauges):
+        if self.state == "out":
+            if self.demo_until is not None:
+                n = max(0, int(self.demo_until - self.t + 0.999))
+                return WARN + f" demo — solving in 0:{n:02d}" + RESET
+            ses = next((g for g in gauges if g["key"] == "five_hour"), None)
+            until = (fmt_until(ses["resets"]) if ses else "") or "soon"
+            return WARN + f" SCRAMBLED — solves {until}"[:WIDTH] + RESET
+        if self._pct is not None and self._pct >= 92:
+            return WARN + f" {len(self.history)} moves deep — almost gone" \
+                + RESET
+        return None
+
+    def gauge_pct(self, g):
+        if g["key"] == "five_hour" and self.state == "out" \
+                and self.demo_until is None:
+            return 100.0
+        return g["pct"]
+
+
 # original 9x6 alien sprites (two march frames each) — not Taito's artwork.
 # Drawn for the HD grid: quadrant cells give 88x(rows*2) virtual pixels.
 INV_SPRITES = {
@@ -2112,9 +2371,10 @@ def run_tui(check=False, scene="fire", dock=False):
     fire = Monitor(client, base_rows)
     tok = TokenScene(client, base_rows - 1)   # one row goes to the prompt
     inv = InvaderScene(client, base_rows)
+    cube = CubeScene(client, base_rows)
     wat = WaterScene(client, base_rows)       # parked: not in the s-cycle
-    order = [fire, tok, inv]
-    mon = {"fire": fire, "tokens": tok, "invaders": inv,
+    order = [fire, tok, inv, cube]
+    mon = {"fire": fire, "tokens": tok, "invaders": inv, "cube": cube,
            "water": wat}.get(scene, fire)
     # if we wake up already rate-limited, start the fire in the ash state
     s = fire.session(gauges)
@@ -2200,7 +2460,7 @@ def run_tui(check=False, scene="fire", dock=False):
                 elif ch == "t":
                     nv = {"auto": "at", "at": "until",
                           "until": "auto"}[mon.view_mode]
-                    for m in (fire, tok, inv, wat):
+                    for m in (fire, tok, inv, cube, wat):
                         m.view_mode = nv
                 elif ch == "r":
                     client.force()
@@ -2289,8 +2549,9 @@ def main():
     if "--scene" in argv:
         i = argv.index("--scene")
         if i + 1 >= len(argv) or argv[i + 1] not in ("fire", "tokens",
-                                                     "invaders", "water"):
-            sys.exit("--scene needs 'fire', 'tokens' or 'invaders'")
+                                                     "invaders", "cube",
+                                                     "water"):
+            sys.exit("--scene needs 'fire', 'tokens', 'invaders' or 'cube'")
         scene = argv[i + 1]
         del argv[i:i + 2]
     dock = "--dock" in argv
