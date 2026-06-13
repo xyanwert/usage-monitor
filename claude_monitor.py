@@ -341,6 +341,7 @@ class UsageClient:
         self.last_session = None
         self._last_force = 0.0
         self._fails = 0
+        self._cools = 0               # consecutive 429s
         self._forced = False
 
     def start(self):
@@ -405,7 +406,7 @@ class UsageClient:
                         self.gauges, self.plan = gauges, plan
                         self.fetched_at, self.error = time.monotonic(), None
                     ok = True
-                    self._fails = 0
+                    self._fails = self._cools = 0
                     save_cache(gauges, plan)
                 except urllib.error.HTTPError as e:
                     if e.code in (401, 403):
@@ -419,8 +420,10 @@ class UsageClient:
                 except Exception:
                     with self.lock:
                         self.error = "offline — retrying"
-            if cool:
-                wait = POLL_SECS
+            if cool:                  # 429: exponential backoff + jitter so
+                self._cools += 1      # a fleet of monitors lets the window cool
+                wait = min(POLL_SECS * 2 ** (self._cools - 1), 600.0) \
+                    + random.uniform(0.0, 10.0)
             elif not ok:              # transient: retry fast, then back off
                 self._fails += 1
                 wait = (5.0 if self._fails <= 1
