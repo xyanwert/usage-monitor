@@ -2094,7 +2094,9 @@ class Monitor:
                     "y": 0.0,
                     "vy": 0.0,
                     "ph": random.uniform(0.0, 6.28),
-                    "drop_at": t + random.uniform(0.4, 2.6),
+                    # heavy burn = drops form fast and let go sooner
+                    "drop_at": t + random.uniform(0.4, 2.6)
+                    / (0.5 + intensity),
                     "burn": None})
         keep = []
         for p in self.pills:
