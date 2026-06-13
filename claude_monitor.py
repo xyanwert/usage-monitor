@@ -1952,16 +1952,20 @@ class Monitor:
             if not 0 <= row < self.rows:
                 continue
             if p["burn"] is None:
-                bg, fg = p["color"], T_INK
-                edge = lerp3(bg, fg, 0.45)   # soft capsule brackets
+                bg, fg = p["color"], (22, 24, 30)
             else:
                 k = clamp((self.t - p["burn"]) / 0.3, 0.0, 1.0)
                 bg = lerp3((255, 230, 160), (200, 60, 10), k)
-                fg = edge = lerp3((90, 30, 10), (255, 240, 200), k)
-            for i, ch in enumerate(p["text"]):
+                fg = lerp3((90, 30, 10), (255, 240, 200), k)
+            # rounded capsule: half-circle caps drawn in the pill color
+            # over whatever is behind them
+            cells = ([("◖", bg, None)]
+                     + [(ch, fg, bg) for ch in p["text"]]
+                     + [("◗", bg, None)])
+            for i, (ch, cfg, cbg) in enumerate(cells):
                 cx = int(p["x"]) + i
                 if 0 <= cx < WIDTH:
-                    overlay[(row, cx)] = (ch, edge if ch in "[]" else fg, bg)
+                    overlay[(row, cx)] = (ch, cfg, cbg)
         return self.pixels(), overlay or None, []
 
     def status_line(self, gauges):
@@ -2080,11 +2084,13 @@ class Monitor:
             self._pill_acc += self.dt * (0.3 + 1.5 * intensity)
             if self._pill_acc >= 1.0 and len(self.pills) < 6:
                 self._pill_acc = 0.0
-                text = "[ token ]"
+                text = " token "
+                grays = ((205, 208, 214), (178, 181, 188),
+                         (150, 153, 160), (122, 125, 132))
                 self.pills.append({       # condensation: cling, then drip
                     "text": text,
-                    "color": PASTELS[random.randrange(len(PASTELS))],
-                    "x": random.uniform(1.0, WIDTH - 1.0 - len(text)),
+                    "color": random.choice(grays),
+                    "x": random.uniform(1.0, WIDTH - 3.0 - len(text)),
                     "y": 0.0,
                     "vy": 0.0,
                     "ph": random.uniform(0.0, 6.28),
