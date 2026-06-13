@@ -1216,6 +1216,8 @@ CUBE_COLS = {
     (1, 0, 0): (215, 65, 55),     # right: red
     (-1, 0, 0): (245, 130, 45),   # left: orange
 }
+# luminance ramp for the 3D-ASCII shader (sparse->dense)
+CUBE_RAMP = " .,:;-=+*oxX#%&@$"
 
 
 def _rotax(p, ax, ang):
@@ -1236,24 +1238,6 @@ def _rot90(p, ax, d):
     if ax == 1:
         return (d * z, y, -d * x)
     return (-d * y, d * x, z)
-
-
-def _fill_quad(buf, pts, color, W2, H):
-    """Scanline-fill a convex quad given four projected (x, y) corners."""
-    ys = [p[1] for p in pts]
-    y0, y1 = max(0, int(min(ys))), min(H - 1, int(max(ys)))
-    for y in range(y0, y1 + 1):
-        yc = y + 0.5
-        xs = []
-        for i in range(4):
-            (xa, ya), (xb, yb) = pts[i], pts[(i + 1) % 4]
-            if (ya <= yc) != (yb <= yc):
-                xs.append(xa + (yc - ya) * (xb - xa) / (yb - ya))
-        if len(xs) >= 2:
-            xs.sort()
-            for x in range(max(0, int(xs[0] + 0.5)),
-                           min(W2, int(xs[-1] + 0.5))):
-                buf[y][x] = color
 
 
 class CubeScene:
@@ -1385,10 +1369,12 @@ class CubeScene:
     # ---- scene interface --------------------------------------------------
 
     def frame(self):
-        H = self.rows * 2
-        W2 = WIDTH * 2
+        # 3D-ASCII shader: sample each sticker, splat luminance-mapped glyphs
+        # into a character-cell z-buffer (donut.c-style). Monochrome glow with
+        # a faint per-sticker tint so the scramble still reads.
+        rows, W = self.rows, WIDTH
         t = self.t
-        buf = [[(7, 7, 9)] * W2 for _ in range(H)]
+        buf = [[(4, 4, 7)] * W for _ in range(rows * 2)]   # black void
         yaw, pitch = self._yaw, -0.42 + 0.18 * math.sin(t * 0.23)
         dim = self.state == "out"
         mv = self.move
@@ -1401,47 +1387,81 @@ class CubeScene:
         def view(p):
             return _rotax(_rotax(p, 1, yaw), 0, pitch)
 
-        light = (0.36, 0.48, 0.80)
-        sy = min(H * 0.128, 6.6)      # fit the 88px width on tall panes too
-        quads = []
+        maxr = 2.5
+        sclX = min(8.5, (W * 0.42) / maxr)
+        sclY = min(sclX * 0.5, (rows * 0.46) / maxr)
+        sclX = min(sclX, sclY * 2.0)
+        cx, cyr = W / 2.0, rows / 2.0
+        D, PS = 5.5, 0.55
+        Lx, Ly, Lz = 0.40, 0.46, 0.79      # light direction
+        E = 0.40                            # tile half-extent (<0.5 = grid gaps)
+        nramp = len(CUBE_RAMP) - 1
+        cell = {}                           # (row, col) -> (z, char, fg)
+
         for pos, n, col in self.stickers:
             moving = mv is not None and pos[ax_m] == layer_m
             ax = n.index(next(c for c in n if c))
-            u, v = [i for i in range(3) if i != ax]
-            corners3 = []
+            ui, vi = [i for i in range(3) if i != ax]
+            c3 = []
             for du, dv in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
-                c3 = [float(pos[0]), float(pos[1]), float(pos[2])]
-                c3[ax] += n[ax] * 0.5
-                c3[u] += du * 0.5
-                c3[v] += dv * 0.5
+                p = [float(pos[0]), float(pos[1]), float(pos[2])]
+                p[ax] += n[ax] * 0.5
+                p[ui] += du * E
+                p[vi] += dv * E
                 if moving:
-                    c3 = _rotax(c3, ax_m, prog)
-                corners3.append(view(tuple(c3)))
+                    p = _rotax(p, ax_m, prog)
+                c3.append(view(tuple(p)))
             nv = view(_rotax(n, ax_m, prog) if moving else n)
-            if nv[2] <= 0.02:
+            if nv[2] <= 0.03:               # back-face cull
                 continue
-            shade = 0.42 + 0.58 * max(0.0, nv[0] * light[0]
-                                      + nv[1] * light[1] + nv[2] * light[2])
-            c = tuple(int(ch * shade) for ch in col)
-            if dim:                    # burnout: the colors drain out
-                g = (c[0] * 3 + c[1] * 5 + c[2] * 2) // 10
-                c = (g, g, int(g * 1.05))
-            plastic = tuple(int(22 * shade) + 6 for _ in range(3))
-            zmid = sum(p[2] for p in corners3) / 4.0
-            quads.append((zmid, corners3, plastic, c))
+            lamb = max(0.0, nv[0] * Lx + nv[1] * Ly + nv[2] * Lz)
+            if dim:
+                g = (col[0] * 3 + col[1] * 5 + col[2] * 2) // 10
+                base = (g + 26, g + 26, g + 32)
+            else:
+                base = lerp3(col, (255, 255, 255), 0.5)
+            # sample density from the sticker's screen span
+            scr = [(cx + x * sclX * (D / (D - z * PS)),
+                    cyr - y * sclY * (D / (D - z * PS))) for x, y, z in c3]
+            span = max(max(p[0] for p in scr) - min(p[0] for p in scr),
+                       max(p[1] for p in scr) - min(p[1] for p in scr))
+            S = int(clamp(span + 3, 6, 12))
+            (x0, y0, z0), (x1, y1, z1) = c3[0], c3[1]
+            (x2, y2, z2), (x3, y3, z3) = c3[2], c3[3]
+            for iu in range(S):
+                u = iu / (S - 1)
+                for iv in range(S):
+                    v = iv / (S - 1)
+                    a, b = 1 - u, 1 - v
+                    w0, w1, w2, w3 = a * b, u * b, u * v, a * v
+                    x = w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3
+                    y = w0 * y0 + w1 * y1 + w2 * y2 + w3 * y3
+                    z = w0 * z0 + w1 * z1 + w2 * z2 + w3 * z3
+                    f = D / (D - z * PS)
+                    cc, rr = int(cx + x * sclX * f), int(cyr - y * sclY * f)
+                    if not (0 <= cc < W and 0 <= rr < rows):
+                        continue
+                    prev = cell.get((rr, cc))
+                    if prev is not None and prev[0] >= z:
+                        continue
+                    vx, vy, vz = -x, -y, D - z   # specular sweep highlight
+                    vl = math.sqrt(vx * vx + vy * vy + vz * vz) or 1.0
+                    hx, hy, hz = Lx + vx / vl, Ly + vy / vl, Lz + vz / vl
+                    hl = math.sqrt(hx * hx + hy * hy + hz * hz) or 1.0
+                    spec = max(0.0, (nv[0] * hx + nv[1] * hy + nv[2] * hz)
+                               / hl) ** 6
+                    depth01 = clamp((z + maxr) / (2 * maxr), 0.0, 1.0)
+                    lum = clamp(0.16 + 0.50 * lamb + 0.20 * depth01
+                                + 0.55 * spec, 0.0, 1.0)
+                    ch = CUBE_RAMP[int(lum * nramp)] or "."
+                    sh = 0.32 + 0.85 * lum
+                    fg = (min(255, int(base[0] * sh)),
+                          min(255, int(base[1] * sh)),
+                          min(255, int(base[2] * sh)))
+                    cell[(rr, cc)] = (z, ch if ch != " " else ".", fg)
 
-        cx, cy = W2 / 2.0, H / 2.0
-        for zmid, corners3, plastic, c in sorted(quads, key=lambda q: q[0]):
-            pts = []
-            for x, y, z in corners3:
-                f = 5.5 / (5.5 - z * 0.55)
-                pts.append((cx + x * sy * 2.0 * f, cy - y * sy * f))
-            _fill_quad(buf, pts, plastic, W2, H)
-            ctr = (sum(p[0] for p in pts) / 4.0, sum(p[1] for p in pts) / 4.0)
-            inset = [(px + (ctr[0] - px) * 0.18, py + (ctr[1] - py) * 0.18)
-                     for px, py in pts]
-            _fill_quad(buf, inset, c, W2, H)
-        return buf, None, []
+        overlay = {k: (v[1], v[2], (4, 4, 7)) for k, v in cell.items()}
+        return buf, overlay or None, []
 
     def status_line(self, gauges):
         if self.state == "out":
