@@ -160,7 +160,28 @@ the whole arc into 12s.
 
 ---
 
-Resolved: **fire, tokenfall and invaders live in the monitor as scenes**
+## Concept #5: CUBE (2026-06-12, user's dare: "too crazy for AI?")
+
+A real 3D Rubik's cube on the 88px quadrant grid: 54 stickers as
+perspective-projected, flat-lit, painter-sorted quads (plastic underquad +
+inset sticker = free grid lines), the whole cube tumbling on a precessing
+axis while individual layers rotate through smoothstep-eased 90° turns.
+
+| Signal | Visual |
+|---|---|
+| session % | scramble depth — one layer turn per ~1.5% (66 = chaos) |
+| burn rate / busy | tumble speed, turn cadence |
+| 100% | the colors drain to gray — SCRAMBLED |
+| waiting for reset | it solves itself, paced by the countdown, pristine exactly at reset |
+| rollover | speed-solve volley |
+
+The solver is the scramble history replayed backwards — mathematically
+exact, zero solver code, and the sticker permutation algebra (`_rot90` on
+position + normal per layer) is verified by 4×quarter-turn = identity.
+
+---
+
+Resolved: **fire, tokenfall, invaders and cube live in the monitor as scenes**
 (`s` cycles them; `claude-monitor --scene fire|tokens|invaders`, also with
 `side`). FIZZ is parked by user verdict ("not sure it gives me what i
 want") — out of the rotation, code kept, reachable via the hidden
