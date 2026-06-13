@@ -1691,14 +1691,15 @@ class Monitor:
                 continue
             if p["burn"] is None:
                 bg, fg = p["color"], T_INK
+                edge = lerp3(bg, fg, 0.45)   # soft capsule brackets
             else:
                 k = clamp((self.t - p["burn"]) / 0.3, 0.0, 1.0)
                 bg = lerp3((255, 230, 160), (200, 60, 10), k)
-                fg = lerp3((90, 30, 10), (255, 240, 200), k)
+                fg = edge = lerp3((90, 30, 10), (255, 240, 200), k)
             for i, ch in enumerate(p["text"]):
                 cx = int(p["x"]) + i
                 if 0 <= cx < WIDTH:
-                    overlay[(row, cx)] = (ch, fg, bg)
+                    overlay[(row, cx)] = (ch, edge if ch in "[]" else fg, bg)
         return self.pixels(), overlay or None, []
 
     def status_line(self, gauges):
@@ -1817,22 +1818,24 @@ class Monitor:
             self._pill_acc += self.dt * (0.3 + 1.5 * intensity)
             if self._pill_acc >= 1.0 and len(self.pills) < 6:
                 self._pill_acc = 0.0
-                text = random.choice(("t", "o", "k", "e", "n",
-                                      "to", "ok", "en", "tok", "ken"))
-                self.pills.append({       # rain down from the sky
+                text = "[ token ]"
+                self.pills.append({       # condensation: cling, then drip
                     "text": text,
                     "color": PASTELS[random.randrange(len(PASTELS))],
-                    "x": random.uniform(2.0, WIDTH - 2.0 - len(text)),
-                    "y": -2.0,
-                    "vx": random.uniform(-2.5, 2.5),
-                    "vy": random.uniform(2.0, 9.0),
+                    "x": random.uniform(1.0, WIDTH - 1.0 - len(text)),
+                    "y": 0.0,
+                    "vy": 0.0,
+                    "ph": random.uniform(0.0, 6.28),
+                    "drop_at": t + random.uniform(0.4, 2.6),
                     "burn": None})
         keep = []
         for p in self.pills:
             if p["burn"] is None:
-                p["vy"] += 26.0 * self.dt
-                p["x"] += p["vx"] * self.dt
-                p["y"] += p["vy"] * self.dt
+                if t < p["drop_at"]:      # stuck to the ceiling, sagging
+                    p["y"] = 0.4 + 0.45 * math.sin(t * 2.6 + p["ph"])
+                else:                     # lets go: free fall, real g
+                    p["vy"] += 75.0 * self.dt
+                    p["y"] += p["vy"] * self.dt
                 cx = int(clamp(p["x"] + len(p["text"]) / 2, 0, WIDTH - 1))
                 cy = int(clamp(p["y"], 0, H - 1))
                 if p["y"] >= H - 2 or self.fire.cells[cy][cx] > 11:
