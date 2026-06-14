@@ -30,9 +30,11 @@ Usage:
   claude_monitor.py --once          fetch usage once, print, exit
   claude_monitor.py --check         headless render smoke test
 
-Frames are wrapped in DEC 2026 synchronized updates, so on terminals that
-support it (kitty, Ghostty, iTerm2, WezTerm, recent VTE) the sibling pane's
-cursor doesn't flicker. On older terminals, lower --fps (e.g. 12) to tame it.
+Outside tmux, frames are wrapped in DEC 2026 synchronized updates so
+terminals that support it (kitty, Ghostty, iTerm2, WezTerm, recent VTE) apply
+each one atomically. Inside tmux we skip that and let tmux render the pane —
+forcing app-level sync through tmux can wedge the session. Lower --fps (e.g.
+12) on slow terminals.
 
 Keys:  s  switch scene (fire / tokenfall)       r  refresh now
        t  toggle "resets at" / "time until"     q  quit
@@ -2572,6 +2574,13 @@ def run_tui(check=False, scene="fire", dock=False):
         fire.state = "ash"
 
     interactive = sys.stdin.isatty() and not check
+    # Synchronized output (DEC 2026) makes a terminal apply each frame
+    # atomically — great in a plain window. We use it only OUTSIDE tmux: tmux
+    # renders the pane itself, and pushing app-level sync through tmux (plus
+    # the old Sync terminal-override) can wedge the whole session on modern
+    # tmux/terminal combos. The dock pane runs with $TMUX set, so this
+    # auto-disables there.
+    sync = not os.environ.get("TMUX")
     fd = old_attrs = None
     if interactive:
         import termios
@@ -2602,11 +2611,10 @@ def run_tui(check=False, scene="fire", dock=False):
             eff = ((sess or {}).get("effort") or "").lower()
             fire.ultra = eff in ("ultracode", "xhigh", "ultra")
             mon.update(gauges, rate, busy)
-            # DEC 2026 synchronized update: terminals that support it apply
-            # the frame atomically — no cursor hide/show flicker in siblings
-            sys.stdout.write("\x1b[?2026h"
-                             + render(mon, gauges, plan, age, error, rate,
-                                      sess) + "\x1b[?2026l")
+            frame_out = render(mon, gauges, plan, age, error, rate, sess)
+            if sync:   # atomic frame outside tmux; inside tmux, tmux redraws
+                frame_out = "\x1b[?2026h" + frame_out + "\x1b[?2026l"
+            sys.stdout.write(frame_out)
             sys.stdout.flush()
             frame += 1
 
@@ -2683,10 +2691,7 @@ def run_side(cmd, scene="fire"):
     if FPS != 28:
         self_cmd += f" --fps {FPS}"
     inner = cmd or [os.environ.get("SHELL", "bash")]
-    sync_override = ",*:Sync=\\E[?2026%?%p1%{1}%=%th%el%;"
     if os.environ.get("TMUX"):
-        subprocess.run(["tmux", "set-option", "-as", "terminal-overrides",
-                        sync_override], stderr=subprocess.DEVNULL)
         out = subprocess.run(["tmux", "split-window", "-h", "-l", str(WIDTH),
                               "-d", "-P", "-F", "#{pane_id}", self_cmd],
                              check=True, capture_output=True, text=True)
@@ -2700,8 +2705,7 @@ def run_side(cmd, scene="fire"):
         os.execvp("tmux", [
             "tmux", "new-session", f"{inner_str}; tmux kill-session", ";",
             "split-window", "-h", "-l", str(WIDTH), "-d", self_cmd, ";",
-            "set-option", "mouse", "on", ";",
-            "set-option", "-as", "terminal-overrides", sync_override,
+            "set-option", "mouse", "on",
         ])
     if shutil.which("gnome-terminal"):
         subprocess.Popen(["gnome-terminal", "--geometry",
