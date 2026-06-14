@@ -63,6 +63,7 @@ POLL_SECS = 60.0
 POLL_SECS_HOT = 15.0          # while rate-limited and reset is near
 DEMO_BURNOUT_SECS = 8.0
 REIGNITE_SECS = 1.8
+COIN_MELT = 0.55              # seconds a token-coin takes to melt into the fire
 
 CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 SESS_DIR = os.path.expanduser("~/.claude/sessions")
@@ -502,6 +503,35 @@ def lerp3(a, b, k):
     return (int(a[0] + (b[0] - a[0]) * k),
             int(a[1] + (b[1] - a[1]) * k),
             int(a[2] + (b[2] - a[2]) * k))
+
+
+def _ramp(stops, n):
+    """Interpolate `stops` [(t, (r,g,b)), ...] into an n-entry color table."""
+    out = []
+    for i in range(n):
+        t = i / (n - 1)
+        for k in range(len(stops) - 1):
+            t0, c0 = stops[k]
+            t1, c1 = stops[k + 1]
+            if t <= t1 or k == len(stops) - 2:
+                f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+                f = 0.0 if f < 0.0 else 1.0 if f > 1.0 else f
+                out.append((int(c0[0] + (c1[0] - c0[0]) * f),
+                            int(c0[1] + (c1[1] - c0[1]) * f),
+                            int(c0[2] + (c1[2] - c0[2]) * f)))
+                break
+    return out
+
+
+# ultracode tell: the whole fire burns a high-contrast electric violet
+# (deep void -> indigo -> neon violet -> hot magenta -> white-hot) instead
+# of the doom red/orange. Cranked contrast: darks sink deeper and hold
+# longer, mids go neon-saturated, brights blow out hotter.
+VIOLET_PALETTE = _ramp(
+    [(0.00, (3, 2, 5)), (0.18, (16, 4, 32)), (0.37, (62, 12, 120)),
+     (0.55, (122, 26, 212)), (0.71, (194, 52, 247)),
+     (0.84, (242, 118, 254)), (0.93, (252, 212, 255)),
+     (1.00, (255, 255, 255))], len(PALETTE))
 
 
 def add_px(buf, x, y, color, k):
@@ -1520,6 +1550,33 @@ SAUCER_PX = _sprite(SAUCER_S)
 QUADS = " ▗▖▄▝▐▞▟▘▚▌▙▀▜▛█"
 
 
+def _build_sextants():
+    """64-entry table: 6-bit sub-cell mask -> glyph. Sextants live at
+    U+1FB00.., but the all-blank, left-half, right-half and full masks reuse
+    existing block chars and are skipped in that range."""
+    out = []
+    for m in range(64):
+        if m == 0:
+            out.append(" ")
+        elif m == 0x15:                      # cols 1,3,5 -> left half block
+            out.append("▌")
+        elif m == 0x2A:                      # cols 2,4,6 -> right half block
+            out.append("▐")
+        elif m == 0x3F:
+            out.append("█")
+        else:
+            off = m - 1
+            if m > 0x15:
+                off -= 1
+            if m > 0x2A:
+                off -= 1
+            out.append(chr(0x1FB00 + off))
+    return out
+
+
+SEXTANTS = _build_sextants()
+
+
 class InvaderScene:
     """INVADERS: your quota is a fleet — every burned token shoots one down.
 
@@ -1937,8 +1994,9 @@ class Monitor:
         self.smoke = []
         self.mound = []
         self.embers = []
-        self.pills = []               # tokens lobbed into the flames
-        self._pill_acc = 0.0
+        self.coins = []               # token-coins melting into the flames
+        self._coin_acc = 0.0
+        self.ultra = False            # claude on ultracode -> violet flame
         self.prev_pct = None
 
     def resize(self, fire_rows):
@@ -1966,27 +2024,10 @@ class Monitor:
     # ---- scene interface --------------------------------------------------
 
     def frame(self):
-        overlay = {}
-        for p in self.pills:
-            row = int(p["y"] // 2)
-            if not 0 <= row < self.rows:
-                continue
-            if p["burn"] is None:
-                bg, fg = p["color"], (22, 24, 30)
-            else:
-                k = clamp((self.t - p["burn"]) / 0.3, 0.0, 1.0)
-                bg = lerp3((255, 230, 160), (200, 60, 10), k)
-                fg = lerp3((90, 30, 10), (255, 240, 200), k)
-            # rounded capsule: half-circle caps drawn in the pill color
-            # over whatever is behind them
-            cells = ([("◖", bg, None)]
-                     + [(ch, fg, bg) for ch in p["text"]]
-                     + [("◗", bg, None)])
-            for i, (ch, cfg, cbg) in enumerate(cells):
-                cx = int(p["x"]) + i
-                if 0 <= cx < WIDTH:
-                    overlay[(row, cx)] = (ch, cfg, cbg)
-        return self.pixels(), overlay or None, []
+        # the fire renders at half-block res; the coins ride on top as a
+        # higher-res quadrant overlay (88 sub-columns instead of 44)
+        buf = self.pixels()
+        return buf, self._coin_overlay(buf), []
 
     def status_line(self, gauges):
         if self.state in ("dying", "ash"):
@@ -2089,64 +2130,62 @@ class Monitor:
         if self.state in ("normal", "dying"):
             intensity = clamp(max(rate / 2.0, 0.55 if busy else 0.0),
                               0.04, 1.0)
-            self._update_pills(intensity if self.state == "normal" else 0.0)
-        elif self.pills:
-            self.pills = []
+            self._update_coins(intensity if self.state == "normal" else 0.0)
+        elif self.coins:
+            self.coins = []
 
         if self.state in ("normal", "reignite"):
             self.prev_pct = pct
         self._update_smoke()
 
-    def _update_pills(self, intensity):
+    def _update_coins(self, intensity):
         H = self.fire.h
         t = self.t
         if intensity > 0.06:
-            self._pill_acc += self.dt * (0.3 + 1.5 * intensity)
-            if self._pill_acc >= 1.0 and len(self.pills) < 6:
-                self._pill_acc = 0.0
-                text = " token "
-                grays = ((205, 208, 214), (178, 181, 188),
-                         (150, 153, 160), (122, 125, 132))
-                self.pills.append({       # condensation: cling, then drip
-                    "text": text,
-                    "color": random.choice(grays),
-                    "x": random.uniform(1.0, WIDTH - 3.0 - len(text)),
-                    "y": 0.0,
-                    "vy": 0.0,
-                    "ph": random.uniform(0.0, 6.28),
-                    # heavy burn = drops form fast and let go sooner
-                    "drop_at": t + random.uniform(0.4, 2.6)
-                    / (0.5 + intensity),
+            self._coin_acc += self.dt * (0.3 + 1.5 * intensity)
+            if self._coin_acc >= 1.0 and len(self.coins) < 6:
+                self._coin_acc = 0.0
+                self.coins.append({       # drop straight in from the top
+                    "x": random.uniform(5.0, WIDTH - 5.0),
+                    "y": random.uniform(-2.0, 0.0),
+                    "vy": random.uniform(2.0, 11.0),    # small spread, no cling
+                    "R": random.uniform(2.8, 3.9),      # coin radius (px)
+                    "ax": random.uniform(0.0, 6.28),    # face orientation
+                    "ay": random.uniform(0.0, 6.28),
+                    "wx": random.uniform(-3.2, 3.2),    # tumble rate
+                    "wy": random.uniform(-3.2, 3.2),
                     "burn": None})
         keep = []
-        for p in self.pills:
-            if p["burn"] is None:
-                if t < p["drop_at"]:      # stuck to the ceiling, sagging
-                    p["y"] = 0.4 + 0.45 * math.sin(t * 2.6 + p["ph"])
-                else:                     # lets go: free fall, real g
-                    p["vy"] += 75.0 * self.dt
-                    p["y"] += p["vy"] * self.dt
-                cx = int(clamp(p["x"] + len(p["text"]) / 2, 0, WIDTH - 1))
-                cy = int(clamp(p["y"], 0, H - 1))
-                if p["y"] >= H - 2 or self.fire.cells[cy][cx] > 11:
-                    p["burn"] = t                     # caught fire
-                    for dx in range(-1, len(p["text"]) + 1):
-                        fx = int(p["x"]) + dx         # fuel: the fire flares
+        for c in self.coins:
+            c["ax"] += c["wx"] * self.dt              # always tumbling
+            c["ay"] += c["wy"] * self.dt
+            if c["burn"] is None:
+                c["vy"] += 75.0 * self.dt             # gravity from spawn
+                c["y"] += c["vy"] * self.dt
+                cx = int(clamp(c["x"], 0, WIDTH - 1))
+                cy = int(clamp(c["y"], 0, H - 1))
+                if c["y"] >= H - 2 or (c["y"] > 2.0
+                                       and self.fire.cells[cy][cx] > 11):
+                    c["burn"] = t                     # hit the fire: melts
+                    c["wx"] *= 0.35                   # tumble settles as it slumps
+                    c["wy"] *= 0.35
+                    for dx in range(-2, 3):           # fuel: the fire flares
+                        fx = int(c["x"]) + dx
                         if 0 <= fx < WIDTH:
                             for dy in (0, 1, 2):
                                 fy = min(H - 1, cy + dy)
                                 self.fire.cells[fy][fx] = min(
-                                    MAXHEAT, self.fire.cells[fy][fx] + 24)
-                    for _ in range(2):
+                                    MAXHEAT, self.fire.cells[fy][fx] + 22)
+                    for _ in range(3):
                         self.sparks.append(
-                            [p["x"] + random.uniform(0, len(p["text"])),
-                             p["y"] - 1.0, -random.uniform(14.0, 26.0),
-                             0.0, random.uniform(0.3, 0.6)])
-                keep.append(p)
-            elif t - p["burn"] < 0.3:
-                p["y"] += 6.0 * self.dt               # sinks as it burns
-                keep.append(p)
-        self.pills = keep
+                            [c["x"] + random.uniform(-2, 2), c["y"] - 1.0,
+                             -random.uniform(14.0, 26.0), 0.0,
+                             random.uniform(0.3, 0.6)])
+                keep.append(c)
+            elif t - c["burn"] < COIN_MELT:
+                c["y"] += 7.0 * self.dt               # molten coin sinks in
+                keep.append(c)
+        self.coins = keep
 
     def _reignite_step(self, heat, p):
         fire = self.fire
@@ -2190,7 +2229,8 @@ class Monitor:
 
     def pixels(self):
         H, W = self.fire.h, WIDTH
-        buf = [[PALETTE[v] for v in row] for row in self.fire.cells]
+        pal = VIOLET_PALETTE if self.ultra else PALETTE
+        buf = [[pal[v] for v in row] for row in self.fire.cells]
 
         if self.mound and self.state in ("ash", "reignite"):
             for x in range(W):
@@ -2199,7 +2239,10 @@ class Monitor:
                     buf[H - 1 - dy][x] = (g + 10, g, g - 4)
             for (ex, depth, phase) in self.embers:
                 s = (math.sin(self.t * 2.2 + phase) + 1) / 2
-                buf[H - 1 - depth][ex] = (int(60 + 160 * s), int(20 + 70 * s), 10)
+                buf[H - 1 - depth][ex] = (
+                    (int(32 + 144 * s), int(12 + 48 * s), int(58 + 172 * s))
+                    if self.ultra
+                    else (int(60 + 160 * s), int(20 + 70 * s), 10))
 
         for p in self.smoke:
             x, y = int(p[0]), int(p[1])
@@ -2207,11 +2250,126 @@ class Monitor:
                 g = int(30 + 80 * (1 - p[3] / p[4]))
                 buf[y][x] = (g, g, g + 6)
 
+        spark_col = (248, 224, 255) if self.ultra else (255, 235, 170)
         for s in self.sparks:
             x, y = int(s[0]), int(s[1])
             if 0 <= x < W and 0 <= y < H:
-                buf[y][x] = (255, 235, 170)
+                buf[y][x] = spark_col
         return buf
+
+    _COIN_COLD = (210, 168, 78)          # brass token, before it heats
+    # sextant bit for each (vsub % 3, hsub & 1): cell positions 1..6 -> bits
+    _S_BIT = ((1, 2), (4, 8), (16, 32))
+
+    def _coin_overlay(self, buf):
+        """Render each token-coin as a tumbling shaded metal disc into a
+        sextant overlay — 88 sub-columns x (rows*3) sub-rows: 2x the
+        horizontal and 1.5x the vertical resolution of the half-block fire.
+        It catches the firelight, preheats from below, then goes cherry-red
+        -> white-hot and slumps as it melts in."""
+        if not self.coins:
+            return None
+        H, SW, SH = self.fire.h, WIDTH * 2, self.rows * 3
+        sub = {}                         # (vsub, hsub) -> [r, g, b]
+
+        for c in self.coins:
+            R = c["R"]
+            # face normal from the two tumble angles; flip to the viewer side
+            n = _rotax(_rotax((0.0, 0.0, 1.0), 0, c["ax"]), 1, c["ay"])
+            if n[2] < 0.0:
+                n = (-n[0], -n[1], -n[2])
+            # an orthonormal in-plane basis (u, v) perpendicular to the normal
+            a = (0.0, 1.0, 0.0) if abs(n[1]) < 0.9 else (1.0, 0.0, 0.0)
+            ux = n[1] * a[2] - n[2] * a[1]
+            uy = n[2] * a[0] - n[0] * a[2]
+            uz = n[0] * a[1] - n[1] * a[0]
+            ul = math.sqrt(ux * ux + uy * uy + uz * uz) or 1.0
+            u = (ux / ul, uy / ul, uz / ul)
+            v = (n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2],
+                 n[0] * u[1] - n[1] * u[0])
+
+            # heat (0..1), melt slump, and fade
+            if c["burn"] is None:        # preheat as it nears the flame line
+                heat = clamp((c["y"] - (H - 10)) / 10.0, 0.0, 1.0) * 0.35
+                squash, alpha = 1.0, 1.0
+            else:
+                m = clamp((self.t - c["burn"]) / COIN_MELT, 0.0, 1.0)
+                heat = clamp(0.35 + m, 0.0, 1.0)
+                squash = 1.0 - 0.78 * m              # slumps flat
+                alpha = 1.0 - clamp((m - 0.72) / 0.28, 0.0, 1.0)
+            if heat < 0.5:                           # gold -> cherry-red
+                hot = lerp3(self._COIN_COLD, (215, 58, 14), heat / 0.5)
+            else:                                    # cherry-red -> white-hot
+                hot = lerp3((215, 58, 14), (255, 246, 208), (heat - 0.5) / 0.5)
+            emissive = heat * heat                   # hot metal self-glows
+            cxs = c["x"] * 2.0                        # coin center, sub-column
+
+            # scan the disc's own face grid; x doubled into sub-columns gives
+            # the higher res, and the tilt foreshortens it into an ellipse
+            step = 0.34
+            mm = int(R / step) + 1
+            for ai in range(-mm, mm + 1):
+                pa = ai * step
+                for bi in range(-mm, mm + 1):
+                    pb = bi * step
+                    rr2 = pa * pa + pb * pb
+                    if rr2 > R * R:
+                        continue
+                    ox = pa * u[0] + pb * v[0]
+                    oy = (pa * u[1] + pb * v[1]) * squash
+                    hsub = int(round(cxs + ox * 2.0))       # x -> 88 sub-cols
+                    vsub = int(round((c["y"] + oy) * 1.5))  # y -> rows*3 rows
+                    if not (0 <= hsub < SW and 0 <= vsub < SH):
+                        continue
+                    # dome the normal a touch for a soft cross-face gradient
+                    k = 0.5 / R
+                    dn = (n[0] + ox * k,
+                          n[1] + (pa * u[1] + pb * v[1]) * k,
+                          n[2] + (pa * u[2] + pb * v[2]) * k)
+                    dl = math.sqrt(dn[0] * dn[0] + dn[1] * dn[1]
+                                   + dn[2] * dn[2]) or 1.0
+                    vx, vy, vz = dn[0] / dl, dn[1] / dl, dn[2] / dl
+                    key = max(0.0, vx * -0.30 + vy * -0.65 + vz * 0.70)
+                    glow = max(0.0, vy)              # +y is down = the fire
+                    lum = (0.22 + 0.55 * key + (0.30 + 0.55 * heat) * glow
+                           + 0.85 * emissive)
+                    if rr2 > 0.66 * R * R:           # shiny rim bevel
+                        lum += 0.22
+                    lum = clamp(lum, 0.0, 1.35)
+                    col = [min(255, int(hot[0] * lum)),
+                           min(255, int(hot[1] * lum)),
+                           min(255, int(hot[2] * lum))]
+                    if alpha < 0.999:                # fade into the fire
+                        fr = int(clamp(c["y"] + oy, 0, H - 1))
+                        pr, pg, pbb = buf[fr][hsub >> 1]
+                        col = [int(pr + (col[0] - pr) * alpha),
+                               int(pg + (col[1] - pg) * alpha),
+                               int(pbb + (col[2] - pbb) * alpha)]
+                    sub[(vsub, hsub)] = col           # nearest write wins
+
+        # fold the sub-pixels into sextant glyphs, one per terminal cell
+        S = self._S_BIT
+        cells = {}                       # (trow, col) -> [mask, [r,g,b], cnt]
+        for (vsub, hsub), col in sub.items():
+            key = (vsub // 3, hsub >> 1)
+            e = cells.get(key)
+            bit = S[vsub % 3][hsub & 1]
+            if e is None:
+                cells[key] = [bit, list(col), 1]
+            else:
+                e[0] |= bit
+                e[1][0] += col[0]
+                e[1][1] += col[1]
+                e[1][2] += col[2]
+                e[2] += 1
+        overlay = {}
+        for (trow, col), (mask, csum, cnt) in cells.items():
+            fg = (csum[0] // cnt, csum[1] // cnt, csum[2] // cnt)
+            t0, t1 = buf[2 * trow][col], buf[2 * trow + 1][col]   # fire behind
+            bg = ((t0[0] + t1[0]) // 2, (t0[1] + t1[1]) // 2,
+                  (t0[2] + t1[2]) // 2)
+            overlay[(trow, col)] = (SEXTANTS[mask], fg, bg)
+        return overlay
 
 
 # --------------------------------------------------------------------------
@@ -2440,6 +2598,9 @@ def run_tui(check=False, scene="fire", dock=False):
                 sess = claude_session_info()
                 sess_next = time.monotonic() + 2.0
             busy = bool(sess and sess.get("status") == "busy")
+            # ultracode effort -> the fire burns violet
+            eff = ((sess or {}).get("effort") or "").lower()
+            fire.ultra = eff in ("ultracode", "xhigh", "ultra")
             mon.update(gauges, rate, busy)
             # DEC 2026 synchronized update: terminals that support it apply
             # the frame atomically — no cursor hide/show flicker in siblings

@@ -27,21 +27,58 @@ limit*: GAME OVER, then reinforcements beam in on the real countdown. The
 march panics as the fleet thins; a saucer crosses whenever fresh data lands.
 (Original sprites — HD quadrant rendering at 88px virtual resolution.)
 
-## Quick start
+## Install
 
-Requirements: Python 3.8+, a truecolor terminal, a logged-in
-[Claude Code](https://claude.com/claude-code) (that's where the OAuth token
-comes from), and optionally `tmux` for the split-screen dock.
+### Homebrew (macOS & Linux) — recommended
+
+```bash
+brew install xyanwert/tap/claude-monitor
+```
+
+That single command adds the tap and pulls in everything it needs — Python 3
+and `tmux` (for the split-screen dock). It's shorthand for:
+
+```bash
+brew tap xyanwert/tap
+brew install claude-monitor
+```
+
+**Update to the latest release:**
+
+```bash
+brew update && brew upgrade claude-monitor
+```
+
+**Track the bleeding edge** (latest `main`, rebuilt from source):
+
+```bash
+brew install --HEAD xyanwert/tap/claude-monitor
+# later: brew upgrade --fetch-HEAD claude-monitor
+```
+
+**Uninstall:** `brew uninstall claude-monitor` (and `brew untap xyanwert/tap`
+to forget the tap entirely).
+
+### Manual (any platform)
 
 ```bash
 git clone https://github.com/xyanwert/usage-monitor.git
 cd usage-monitor
-ln -s "$PWD/claude_monitor.py" ~/.local/bin/claude-monitor
 chmod +x claude_monitor.py
+ln -s "$PWD/claude_monitor.py" ~/.local/bin/claude-monitor   # if ~/.local/bin is on your PATH
+```
 
+Requirements: Python 3.8+, a truecolor terminal, and a logged-in
+[Claude Code](https://claude.com/claude-code) (that's where the OAuth token
+comes from). `tmux` is needed only for the `side` split-screen dock — Homebrew
+installs it for you.
+
+## Run
+
+```bash
 claude-monitor                   # full-window monitor
 claude-monitor side claude       # the good stuff: claude left, fire right
-claude-monitor --scene invaders  # pick your poison: fire | tokens | invaders
+claude-monitor --scene invaders  # pick your poison: fire | tokens | invaders | cube
 claude-monitor --once            # print usage once and exit
 ```
 
