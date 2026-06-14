@@ -61,6 +61,19 @@ from datetime import datetime, timedelta, timezone
 
 WIDTH = 44
 FPS = 28
+# Under tmux the frame rate adapts between these bounds: tmux parses every
+# cell on one thread, so the full-rate truecolor fire can saturate it and
+# freeze the whole session. We start low and only ramp up while writes stay
+# fast (see run_tui's adaptive pacing).
+DOCK_FPS = 15                 # ceiling under tmux (unless the user set --fps)
+DOCK_FPS_MIN = 4              # floor the adaptive throttle backs off to
+_FPS_SET = False              # did the user pass --fps explicitly?
+LOWCOLOR = False              # under tmux: emit 256-color (much cheaper for
+                              # tmux to process) instead of 24-bit truecolor
+# each rendered row starts with an absolute cursor move to column 1; split on
+# it to diff frames row-by-row and re-send only what changed (fewer bytes for
+# tmux to parse)
+_ROWSPLIT = re.compile(r"(?=\x1b\[\d+;1H)")
 POLL_SECS = 60.0
 POLL_SECS_HOT = 15.0          # while rate-limited and reset is near
 DEMO_BURNOUT_SECS = 8.0
@@ -2410,6 +2423,26 @@ def pct_color(pct):
     return PALETTE[10 + int(min(99.9, pct) * 0.26)]
 
 
+def _rgb256(r, g, b):
+    """Nearest xterm-256 index: 6x6x6 color cube (16-231) + grayscale ramp."""
+    if abs(r - g) < 8 and abs(g - b) < 8:          # near-gray -> gray ramp
+        if r < 8:
+            return 16
+        if r > 248:
+            return 231
+        return 232 + (r - 8) * 24 // 247
+    q = lambda v: 0 if v < 48 else 1 if v < 115 else (v - 35) // 40
+    return 16 + 36 * q(r) + 6 * q(g) + q(b)
+
+
+def _sgr(f, b):
+    """fg+bg SGR for a half-block cell — 256-color under tmux, else truecolor."""
+    if LOWCOLOR:
+        return "\x1b[38;5;%d;48;5;%dm" % (_rgb256(*f), _rgb256(*b))
+    return "\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm" % (f[0], f[1], f[2],
+                                                  b[0], b[1], b[2])
+
+
 def render(mon, gauges, plan, age, error, rate, sess=None):
     out = []
     row = 1
@@ -2464,8 +2497,7 @@ def render(mon, gauges, plan, age, error, rate, sess=None):
             else:
                 ch, f, b = "▀", top[x], bot[x]
             if (f, b) != last:
-                parts.append("\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm"
-                             % (f[0], f[1], f[2], b[0], b[1], b[2]))
+                parts.append(_sgr(f, b))
                 last = (f, b)
             parts.append(ch)
         parts.append(RESET)
@@ -2511,8 +2543,9 @@ def render(mon, gauges, plan, age, error, rate, sess=None):
             pct = mon.gauge_pct(g)
             filled = int(round(pct * 23 / 100))
             c = pct_color(pct)
-            bar = ("\x1b[38;2;%d;%d;%dm" % c) + "█" * filled \
-                + DIM + "·" * (23 - filled) + RESET
+            bar_c = ("\x1b[38;5;%dm" % _rgb256(*c)) if LOWCOLOR \
+                else ("\x1b[38;2;%d;%d;%dm" % c)
+            bar = bar_c + "█" * filled + DIM + "·" * (23 - filled) + RESET
             label = fmt_until(g["resets"]) if until_view else fmt_at(g["resets"])
             line(DIM + ("%-7s" % g["label"][:7]) + RESET + bar
                  + ("%4d%%" % round(pct)) + DIM + (" %8s" % label[:8]) + RESET)
@@ -2581,6 +2614,17 @@ def run_tui(check=False, scene="fire", dock=False):
     # tmux/terminal combos. The dock pane runs with $TMUX set, so this
     # auto-disables there.
     sync = not os.environ.get("TMUX")
+    # Under tmux, lighten the load tmux has to parse on its single thread:
+    # emit 256-color (cheap) instead of truecolor, and cap the frame rate (the
+    # loop then adapts it down further if writes block). The plain-window path
+    # (iTerm2 etc. render directly) keeps full truecolor at full FPS.
+    # BURNOUT_TRUECOLOR=1 forces truecolor under tmux for fast setups.
+    under_tmux = bool(os.environ.get("TMUX"))
+    global FPS, LOWCOLOR
+    if under_tmux:
+        LOWCOLOR = not os.environ.get("BURNOUT_TRUECOLOR")
+        if not _FPS_SET:
+            FPS = min(FPS, DOCK_FPS)
     fd = old_attrs = None
     if interactive:
         import termios
@@ -2593,6 +2637,10 @@ def run_tui(check=False, scene="fire", dock=False):
     frame = 0
     last_cols = cols
     sess, sess_next = None, 0.0
+    prev_rows = None              # last frame split per-row, for diffing
+    # under tmux start slow and ramp up only while writes stay fast (adaptive
+    # throttle below); a plain window runs at the fixed target rate
+    eff_fps = float(DOCK_FPS_MIN) if under_tmux else float(FPS)
     try:
         next_t = time.monotonic()
         while True:
@@ -2612,10 +2660,24 @@ def run_tui(check=False, scene="fire", dock=False):
             fire.ultra = eff in ("ultracode", "xhigh", "ultra")
             mon.update(gauges, rate, busy)
             frame_out = render(mon, gauges, plan, age, error, rate, sess)
-            if sync:   # atomic frame outside tmux; inside tmux, tmux redraws
-                frame_out = "\x1b[?2026h" + frame_out + "\x1b[?2026l"
-            sys.stdout.write(frame_out)
-            sys.stdout.flush()
+            # row-diff: resend only the rows that changed since last frame, so
+            # tmux has far less to parse (huge win when the fire is short and
+            # most rows are static void). Falls back to a full paint whenever
+            # the layout shifts (row count differs) or after a screen clear.
+            rows = _ROWSPLIT.split(frame_out)
+            if prev_rows is not None and len(rows) == len(prev_rows):
+                payload = "".join(r for r, p in zip(rows, prev_rows) if r != p)
+            else:
+                payload = frame_out
+            prev_rows = rows
+            wrote, write_dt = bool(payload), 0.0
+            if wrote:
+                if sync:   # atomic outside tmux; inside tmux, tmux redraws
+                    payload = "\x1b[?2026h" + payload + "\x1b[?2026l"
+                t_w = time.monotonic()
+                sys.stdout.write(payload)
+                sys.stdout.flush()
+                write_dt = time.monotonic() - t_w
             frame += 1
 
             if frame % 28 == 0:
@@ -2634,10 +2696,21 @@ def run_tui(check=False, scene="fire", dock=False):
                         mon.resize(want)
                     last_cols = ncols
                     sys.stdout.write("\x1b[2J")
+                    prev_rows = None          # cleared screen: repaint in full
 
             if not interactive:
                 continue
-            next_t += 1.0 / FPS
+            # adaptive throttle under tmux: a slow write means the pane's pty
+            # backed up (tmux is saturated parsing our output) — ease off so
+            # tmux regains idle time for input and the sibling pane; when
+            # writes are quick, drift back up toward the cap. Bounded so it can
+            # never freeze (floor) or run away (ceiling = FPS).
+            if under_tmux and wrote:
+                if write_dt > 0.06:
+                    eff_fps = max(DOCK_FPS_MIN, eff_fps * 0.7)
+                elif write_dt < 0.02:
+                    eff_fps = min(float(FPS), eff_fps + 0.4)
+            next_t += 1.0 / eff_fps
             now = time.monotonic()
             if next_t < now - 0.25:   # fell behind (lag/suspend): drop the
                 next_t = now          # debt instead of spinning to catch up
@@ -2657,6 +2730,7 @@ def run_tui(check=False, scene="fire", dock=False):
                     if want != mon.rows:
                         mon.resize(want)
                     sys.stdout.write("\x1b[2J")
+                    prev_rows = None          # cleared screen: repaint in full
                 elif ch == "t":
                     nv = {"auto": "at", "at": "until",
                           "until": "auto"}[mon.view_mode]
@@ -2688,8 +2762,8 @@ def run_side(cmd, scene="fire"):
                 f"{shlex.quote(os.path.abspath(__file__))} --dock")
     if scene != "fire":
         self_cmd += f" --scene {shlex.quote(scene)}"
-    if FPS != 28:
-        self_cmd += f" --fps {FPS}"
+    if _FPS_SET:                       # forward an explicit rate; otherwise the
+        self_cmd += f" --fps {FPS}"    # dock auto-caps to DOCK_FPS under tmux
     inner = cmd or [os.environ.get("SHELL", "bash")]
     if os.environ.get("TMUX"):
         out = subprocess.run(["tmux", "split-window", "-h", "-l", str(WIDTH),
@@ -2756,8 +2830,9 @@ def main():
     if "--fps" in argv:
         i = argv.index("--fps")
         try:
-            global FPS
+            global FPS, _FPS_SET
             FPS = clamp(int(argv[i + 1]), 5, 60)
+            _FPS_SET = True
         except (IndexError, ValueError):
             sys.exit("--fps needs a number (5-60)")
         del argv[i:i + 2]
