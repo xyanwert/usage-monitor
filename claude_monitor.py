@@ -61,12 +61,15 @@ from datetime import datetime, timedelta, timezone
 
 WIDTH = 44
 FPS = 28
-# Under tmux the frame rate adapts between these bounds: tmux parses every
-# cell on one thread, so the full-rate truecolor fire can saturate it and
-# freeze the whole session. We start low and only ramp up while writes stay
-# fast (see run_tui's adaptive pacing).
-DOCK_FPS = 15                 # ceiling under tmux (unless the user set --fps)
-DOCK_FPS_MIN = 4              # floor the adaptive throttle backs off to
+# tmux parses every cell on one thread, so the full-rate truecolor fire can
+# saturate it and freeze the whole session. Under tmux we run a fixed, low,
+# empirically-safe rate (no ramp-up: tmux's backlog hides behind buffering, so
+# by the time a write blocks it's already wedged) and only ratchet DOWN if
+# even that backs up. The user can override with --fps or BURNOUT_TRUECOLOR.
+DOCK_FPS = 4                  # default rate under tmux (unless --fps is set);
+                              # 4fps truecolor was confirmed safe, and 256-color
+                              # is cheaper still, so this cannot freeze
+DOCK_FPS_MIN = 3              # floor the downward ratchet can reach
 _FPS_SET = False              # did the user pass --fps explicitly?
 LOWCOLOR = False              # under tmux: emit 256-color (much cheaper for
                               # tmux to process) instead of 24-bit truecolor
@@ -2622,9 +2625,12 @@ def run_tui(check=False, scene="fire", dock=False):
     under_tmux = bool(os.environ.get("TMUX"))
     global FPS, LOWCOLOR
     if under_tmux:
-        LOWCOLOR = not os.environ.get("BURNOUT_TRUECOLOR")
-        if not _FPS_SET:
-            FPS = min(FPS, DOCK_FPS)
+        if os.environ.get("BURNOUT_TRUECOLOR"):
+            LOWCOLOR = False             # user vouches their tmux is fast:
+        else:                            # full truecolor at full FPS
+            LOWCOLOR = True              # 256-color + fixed low rate (default)
+            if not _FPS_SET:
+                FPS = min(FPS, DOCK_FPS)
     fd = old_attrs = None
     if interactive:
         import termios
@@ -2638,9 +2644,9 @@ def run_tui(check=False, scene="fire", dock=False):
     last_cols = cols
     sess, sess_next = None, 0.0
     prev_rows = None              # last frame split per-row, for diffing
-    # under tmux start slow and ramp up only while writes stay fast (adaptive
-    # throttle below); a plain window runs at the fixed target rate
-    eff_fps = float(DOCK_FPS_MIN) if under_tmux else float(FPS)
+    # run at the target rate; under tmux the loop only ratchets this DOWN if
+    # writes back up — it never climbs (climbing walks into the freeze)
+    eff_fps = float(FPS)
     try:
         next_t = time.monotonic()
         while True:
@@ -2700,16 +2706,13 @@ def run_tui(check=False, scene="fire", dock=False):
 
             if not interactive:
                 continue
-            # adaptive throttle under tmux: a slow write means the pane's pty
-            # backed up (tmux is saturated parsing our output) — ease off so
-            # tmux regains idle time for input and the sibling pane; when
-            # writes are quick, drift back up toward the cap. Bounded so it can
-            # never freeze (floor) or run away (ceiling = FPS).
-            if under_tmux and wrote:
-                if write_dt > 0.06:
-                    eff_fps = max(DOCK_FPS_MIN, eff_fps * 0.7)
-                elif write_dt < 0.02:
-                    eff_fps = min(float(FPS), eff_fps + 0.4)
+            # under tmux, ratchet DOWN only: a slow write means the pane's pty
+            # backed up (tmux saturated) — ease off so tmux regains idle time
+            # for input and the sibling pane. We never climb back up; tmux's
+            # backlog hides behind buffering, so a higher rate looks fine right
+            # up until the whole session is already wedged.
+            if under_tmux and wrote and write_dt > 0.06:
+                eff_fps = max(DOCK_FPS_MIN, eff_fps * 0.7)   # backed up: ease off
             next_t += 1.0 / eff_fps
             now = time.monotonic()
             if next_t < now - 0.25:   # fell behind (lag/suspend): drop the

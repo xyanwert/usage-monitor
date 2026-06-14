@@ -86,12 +86,16 @@ claude-monitor --once            # print usage once and exit
 lifetimes together (quit claude and the dock goes too), and turns on mouse
 mode — click a pane to focus it.
 
-Inside tmux the dock auto-throttles: tmux has to re-parse every pixel on one
-thread, so the fire renders in 256 colors and adapts its frame rate to what
-tmux can keep up with (a full-rate truecolor fire can otherwise wedge the
-whole session). If your tmux is fast and you want full truecolor, set
-`BURNOUT_TRUECOLOR=1`; to pin a rate, pass `--fps N`. None of this applies to
-the plain full-window monitor, which always runs full truecolor at full speed.
+Inside tmux the dock is deliberately gentle: tmux re-parses every pixel on a
+single thread, so a full-rate truecolor fire can wedge the whole session.
+There the fire renders in 256 colors at a low fixed frame rate (and eases off
+further if tmux still falls behind). It's smooth and rich in a **plain
+full-window** monitor — under tmux it trades framerate for not freezing.
+
+Want it livelier under tmux? `--fps N` raises the rate (find what your tmux
+can take), and `BURNOUT_TRUECOLOR=1` restores full truecolor at full speed for
+fast setups. For the best of both, skip tmux entirely: split your terminal's
+own panes (e.g. iTerm2 `⌘D`) and run plain `claude-monitor` beside `claude`.
 
 ## Keys
 
