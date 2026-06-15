@@ -61,18 +61,17 @@ from datetime import datetime, timedelta, timezone
 
 WIDTH = 44
 FPS = 28
-# tmux parses every cell on one thread, so the full-rate truecolor fire can
-# saturate it and freeze the whole session. Under tmux we run a fixed, low,
-# empirically-safe rate (no ramp-up: tmux's backlog hides behind buffering, so
-# by the time a write blocks it's already wedged) and only ratchet DOWN if
-# even that backs up. The user can override with --fps or BURNOUT_TRUECOLOR.
+# tmux re-renders every cell on one thread, so under tmux we run a fixed, low
+# rate (no ramp-up: tmux's backlog hides behind buffering, so by the time a
+# write blocks it's already wedged) and only ratchet DOWN if even that backs up.
+# Truecolor at this rate is confirmed smooth; the indexed-color path is NOT (it
+# froze iTerm2 under tmux), so we keep truecolor. Override with --fps.
 DOCK_FPS = 4                  # default rate under tmux (unless --fps is set);
-                              # 4fps truecolor was confirmed safe, and 256-color
-                              # is cheaper still, so this cannot freeze
+                              # 4fps truecolor was confirmed safe in iTerm2+tmux
 DOCK_FPS_MIN = 3              # floor the downward ratchet can reach
 _FPS_SET = False              # did the user pass --fps explicitly?
-LOWCOLOR = False              # under tmux: emit 256-color (much cheaper for
-                              # tmux to process) instead of 24-bit truecolor
+LOWCOLOR = False              # 256-color instead of truecolor; opt-in under tmux
+                              # via BURNOUT_LOWCOLOR=1 (truecolor is the default)
 # each rendered row starts with an absolute cursor move to column 1; split on
 # it to diff frames row-by-row and re-send only what changed (fewer bytes for
 # tmux to parse)
@@ -2617,20 +2616,18 @@ def run_tui(check=False, scene="fire", dock=False):
     # tmux/terminal combos. The dock pane runs with $TMUX set, so this
     # auto-disables there.
     sync = not os.environ.get("TMUX")
-    # Under tmux, lighten the load tmux has to parse on its single thread:
-    # emit 256-color (cheap) instead of truecolor, and cap the frame rate (the
-    # loop then adapts it down further if writes block). The plain-window path
-    # (iTerm2 etc. render directly) keeps full truecolor at full FPS.
-    # BURNOUT_TRUECOLOR=1 forces truecolor under tmux for fast setups.
+    # Under tmux, keep truecolor but cap the frame rate (tmux re-renders every
+    # cell on one thread; a low fixed rate keeps it relaxed). We do NOT switch
+    # to 256-color: measured byte-rate is tiny either way, and iTerm2 under tmux
+    # freezes on the indexed-color path while truecolor stays smooth — so the
+    # encoding, not the volume, was the culprit. BURNOUT_LOWCOLOR=1 opts back
+    # into 256-color for terminals that genuinely prefer it.
     under_tmux = bool(os.environ.get("TMUX"))
     global FPS, LOWCOLOR
     if under_tmux:
-        if os.environ.get("BURNOUT_TRUECOLOR"):
-            LOWCOLOR = False             # user vouches their tmux is fast:
-        else:                            # full truecolor at full FPS
-            LOWCOLOR = True              # 256-color + fixed low rate (default)
-            if not _FPS_SET:
-                FPS = min(FPS, DOCK_FPS)
+        LOWCOLOR = bool(os.environ.get("BURNOUT_LOWCOLOR"))
+        if not _FPS_SET:
+            FPS = min(FPS, DOCK_FPS)
     fd = old_attrs = None
     if interactive:
         import termios
