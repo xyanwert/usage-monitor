@@ -61,13 +61,11 @@ from datetime import datetime, timedelta, timezone
 
 WIDTH = 44
 FPS = 28
-# tmux re-renders every cell on one thread, so under tmux we run a fixed, low
-# rate (no ramp-up: tmux's backlog hides behind buffering, so by the time a
-# write blocks it's already wedged) and only ratchet DOWN if even that backs up.
-# Truecolor at this rate is confirmed smooth; the indexed-color path is NOT (it
-# froze iTerm2 under tmux), so we keep truecolor. Override with --fps.
-DOCK_FPS = 4                  # default rate under tmux (unless --fps is set);
-                              # 4fps truecolor was confirmed safe in iTerm2+tmux
+# Under tmux we run full truecolor at full FPS (confirmed smooth at 30fps). The
+# old freeze was the 256-color escape path, not the rate; the only safety net is
+# a downward ratchet that eases off if a write actually blocks (no ramp-up:
+# tmux's backlog hides behind buffering, so by the time a write blocks it's
+# already wedged — never climb back up).
 DOCK_FPS_MIN = 3              # floor the downward ratchet can reach
 _FPS_SET = False              # did the user pass --fps explicitly?
 LOWCOLOR = False              # 256-color instead of truecolor; opt-in under tmux
@@ -2616,18 +2614,16 @@ def run_tui(check=False, scene="fire", dock=False):
     # tmux/terminal combos. The dock pane runs with $TMUX set, so this
     # auto-disables there.
     sync = not os.environ.get("TMUX")
-    # Under tmux, keep truecolor but cap the frame rate (tmux re-renders every
-    # cell on one thread; a low fixed rate keeps it relaxed). We do NOT switch
-    # to 256-color: measured byte-rate is tiny either way, and iTerm2 under tmux
-    # freezes on the indexed-color path while truecolor stays smooth — so the
-    # encoding, not the volume, was the culprit. BURNOUT_LOWCOLOR=1 opts back
-    # into 256-color for terminals that genuinely prefer it.
+    # Under tmux we keep full truecolor at full FPS. The old freeze was the
+    # 256-color escape path (iTerm2 chokes on indexed color under tmux), NOT
+    # output volume — measured byte-rate is tiny (~3 KB/s) and truecolor@30fps
+    # is confirmed smooth. So: no color downgrade, no fps cap. The loop's
+    # downward ratchet (below) is the only safety net, and it triggers only on
+    # real write backpressure. BURNOUT_LOWCOLOR=1 opts into 256-color anyway.
     under_tmux = bool(os.environ.get("TMUX"))
-    global FPS, LOWCOLOR
+    global LOWCOLOR
     if under_tmux:
         LOWCOLOR = bool(os.environ.get("BURNOUT_LOWCOLOR"))
-        if not _FPS_SET:
-            FPS = min(FPS, DOCK_FPS)
     fd = old_attrs = None
     if interactive:
         import termios
@@ -2763,7 +2759,7 @@ def run_side(cmd, scene="fire"):
     if scene != "fire":
         self_cmd += f" --scene {shlex.quote(scene)}"
     if _FPS_SET:                       # forward an explicit rate; otherwise the
-        self_cmd += f" --fps {FPS}"    # dock auto-caps to DOCK_FPS under tmux
+        self_cmd += f" --fps {FPS}"    # dock runs at full FPS under tmux
     inner = cmd or [os.environ.get("SHELL", "bash")]
     if os.environ.get("TMUX"):
         out = subprocess.run(["tmux", "split-window", "-h", "-l", str(WIDTH),

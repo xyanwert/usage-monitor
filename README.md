@@ -86,15 +86,10 @@ claude-monitor --once            # print usage once and exit
 lifetimes together (quit claude and the dock goes too), and turns on mouse
 mode — click a pane to focus it.
 
-Inside tmux the dock is deliberately gentle: tmux re-renders every cell on a
-single thread, so the dock runs at a low fixed frame rate (and eases off
-further if tmux still falls behind). The animation stays full truecolor — the
-frame rate is what's capped, not the color.
-
-Want it livelier under tmux? `--fps N` raises the rate (find what your tmux can
-take). For the smoothest, fullest result, skip tmux entirely: split your
-terminal's own panes (e.g. iTerm2 `⌘D`) and run plain `claude-monitor` beside
-`claude` — full truecolor at full speed.
+Inside tmux the dock runs full truecolor at full frame rate, same as a plain
+window. (It only eases off if a write genuinely backs up — a safety net that
+shouldn't trigger in practice.) Tune it with `--fps N` if you like; `⌘D`-style
+native terminal splits work great too.
 
 ## Keys
 
