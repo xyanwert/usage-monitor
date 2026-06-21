@@ -69,10 +69,10 @@ MIN_CONSOLE_ROWS = 12         # open-claude: min rows per console row (n>=3)
 FPS = 28
 # Under tmux we run full truecolor at full FPS (confirmed smooth at 30fps). The
 # old freeze was the 256-color escape path, not the rate; the only safety net is
-# a downward ratchet that eases off if a write actually blocks (no ramp-up:
-# tmux's backlog hides behind buffering, so by the time a write blocks it's
-# already wedged — never climb back up).
-DOCK_FPS_MIN = 3              # floor the downward ratchet can reach
+# a BIDIRECTIONAL rate adapter (in run_tui): it eases off when a write actually
+# blocks and climbs back toward FPS once writes are fast again, so a transient
+# hiccup can't permanently decay the frame rate.
+DOCK_FPS_MIN = 3              # floor the rate adapter can ease down to
 _FPS_SET = False              # did the user pass --fps explicitly?
 LOWCOLOR = False              # 256-color instead of truecolor; opt-in under tmux
                               # via BURNOUT_LOWCOLOR=1 (truecolor is the default)
@@ -2705,13 +2705,19 @@ def run_tui(check=False, scene="fire", dock=False):
 
             if not interactive:
                 continue
-            # under tmux, ratchet DOWN only: a slow write means the pane's pty
-            # backed up (tmux saturated) — ease off so tmux regains idle time
-            # for input and the sibling pane. We never climb back up; tmux's
-            # backlog hides behind buffering, so a higher rate looks fine right
-            # up until the whole session is already wedged.
-            if under_tmux and wrote and write_dt > 0.06:
-                eff_fps = max(DOCK_FPS_MIN, eff_fps * 0.7)   # backed up: ease off
+            # under tmux, adapt the rate to real write back-pressure — but
+            # BIDIRECTIONALLY. A slow write (the pane's pty backed up) eases off
+            # fast; once writes are quick again we climb back toward the target.
+            # The old code only ratcheted down and never recovered, so a single
+            # transient 60ms hiccup (Spaces switch, display sleep, GC pause) cut
+            # the rate permanently and the flame slowly decayed to a crawl. With
+            # the freeze root-caused to the 256-color path (now gone), climbing
+            # back up under truecolor is safe.
+            if under_tmux and wrote:
+                if write_dt > 0.06:                  # backed up: ease off hard
+                    eff_fps = max(DOCK_FPS_MIN, eff_fps * 0.7)
+                elif write_dt < 0.02 and eff_fps < FPS:   # writes are fast again:
+                    eff_fps = min(FPS, eff_fps + 1.0)     # recover ~1 fps/frame
             next_t += 1.0 / eff_fps
             now = time.monotonic()
             if next_t < now - 0.25:   # fell behind (lag/suspend): drop the
