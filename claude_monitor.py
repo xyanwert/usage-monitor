@@ -25,6 +25,10 @@ Usage:
   claude_monitor.py [--scene fire|tokens|invaders|cube] [--fps N]
   claude_monitor.py side [cmd...]   split: monitor docks right (tmux),
                                     cmd (default: your shell) runs left
+  open-claude [n]                   monitor dock right + n panes tiled left
+                                    (n=1..4, default 1: 1 claude / claude +
+                                    terminal / 2 claude over 1 terminal /
+                                    2 claude over 2 terminals)
   claude_monitor.py window          open in its own terminal window
                                     (zero interference with your cursor)
   claude_monitor.py --once          fetch usage once, print, exit
@@ -60,6 +64,8 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 WIDTH = 44
+MIN_CONSOLE_COLS = 40         # open-claude: refuse to split below this per column
+MIN_CONSOLE_ROWS = 12         # open-claude: min rows per console row (n>=3)
 FPS = 28
 # Under tmux we run full truecolor at full FPS (confirmed smooth at 30fps). The
 # old freeze was the 256-color escape path, not the rate; the only safety net is
@@ -2753,13 +2759,25 @@ def run_once():
         print(f"{g['label']:<7}{g['pct']:5.1f}%   resets {at}  ({until})")
 
 
-def run_side(cmd, scene="fire"):
-    self_cmd = (f"{shlex.quote(sys.executable)} "
-                f"{shlex.quote(os.path.abspath(__file__))} --dock")
+def _dock_command(scene):
+    """The shell string that runs this monitor as a docked pane.
+
+    Uses realpath(__file__) so the dock self-invocation always points at the
+    real script, never at an `open-claude` symlink — otherwise the dock pane's
+    argv[0] would read as "open-claude" and recurse into the launcher instead
+    of rendering the monitor.
+    """
+    cmd = (f"{shlex.quote(sys.executable)} "
+           f"{shlex.quote(os.path.realpath(__file__))} --dock")
     if scene != "fire":
-        self_cmd += f" --scene {shlex.quote(scene)}"
-    if _FPS_SET:                       # forward an explicit rate; otherwise the
-        self_cmd += f" --fps {FPS}"    # dock runs at full FPS under tmux
+        cmd += f" --scene {shlex.quote(scene)}"
+    if _FPS_SET:                    # forward an explicit rate; otherwise the
+        cmd += f" --fps {FPS}"      # dock runs at full FPS under tmux
+    return cmd
+
+
+def run_side(cmd, scene="fire"):
+    self_cmd = _dock_command(scene)
     inner = cmd or [os.environ.get("SHELL", "bash")]
     if os.environ.get("TMUX"):
         out = subprocess.run(["tmux", "split-window", "-h", "-l", str(WIDTH),
@@ -2785,6 +2803,141 @@ def run_side(cmd, scene="fire"):
               " install tmux for true in-terminal splits)")
         sys.exit(subprocess.call(inner) if cmd else 0)
     sys.exit("side mode needs tmux (apt/dnf/brew install tmux)")
+
+
+def _console_commands():
+    """Commands for the two pane roles: `claude` (the CLI, shell fallback if it
+    is missing) and a plain terminal shell. Returns (claude_cmd, shell_cmd,
+    claude_missing)."""
+    shell = os.environ.get("SHELL", "bash")
+    claude = shutil.which("claude")
+    if claude:
+        return claude, shell, False
+    return shell, shell, True
+
+
+def _screen_size():
+    """(cols, rows) of the area open-claude will lay panes into."""
+    if os.environ.get("TMUX"):
+        out = subprocess.run(
+            ["tmux", "display-message", "-p", "#{window_width} #{window_height}"],
+            capture_output=True, text=True).stdout.split()
+        if len(out) == 2 and out[0].isdigit() and out[1].isdigit():
+            return int(out[0]), int(out[1])
+    ts = shutil.get_terminal_size((80, 24))
+    return ts.columns, ts.lines
+
+
+def _grid_splits(n):
+    """tmux split steps that carve the console area into n panes.
+
+    Each step is (target_key, direction, new_key): split the pane bound to
+    target_key in `direction` ('-h' = new column, '-v' = new row); the new pane
+    is bound to new_key. 'c1' is the first pane, which already exists.
+      n=2: two columns.            n=3: top row of two, one full-width below.
+      n=4: even 2x2 grid.
+    """
+    return {
+        1: [],
+        2: [("c1", "-h", "c2")],
+        3: [("c1", "-v", "c3"), ("c1", "-h", "c2")],
+        4: [("c1", "-v", "c3"), ("c1", "-h", "c2"), ("c3", "-h", "c4")],
+    }[n]
+
+
+def _console_roles(n):
+    """Which command each pane runs, by pane key. Claude fills the top row;
+    plain terminals fill the rest.
+      n=1: 1 claude.               n=2: 1 claude + 1 terminal.
+      n=3: 2 claude + 1 terminal.  n=4: 2 claude + 2 terminals.
+    """
+    return {
+        1: {"c1": "claude"},
+        2: {"c1": "claude", "c2": "term"},
+        3: {"c1": "claude", "c2": "claude", "c3": "term"},
+        4: {"c1": "claude", "c2": "claude", "c3": "term", "c4": "term"},
+    }[n]
+
+
+def _split_grid(n, c1, cmds):
+    """Split pane `c1` into the n-pane layout, running claude or a terminal in
+    each new pane per _console_roles. `cmds` maps role -> shell-quoted command.
+    Returns the new pane ids."""
+    ids = {"c1": c1}
+    roles = _console_roles(n)
+    extra = []
+    for target_key, direction, new_key in _grid_splits(n):
+        pid = subprocess.run(
+            ["tmux", "split-window", direction, "-t", ids[target_key],
+             "-d", "-P", "-F", "#{pane_id}", cmds[roles[new_key]]],
+            check=True, capture_output=True, text=True).stdout.strip()
+        ids[new_key] = pid
+        extra.append(pid)
+    return extra
+
+
+def open_claude(n, scene="fire"):
+    """Monitor dock on the right + n panes (claude + terminals) tiled in the rest."""
+    if not shutil.which("tmux"):
+        sys.exit("open-claude needs tmux (apt/dnf/brew install tmux)")
+
+    claude_bin, shell_bin, missing = _console_commands()
+    if missing:
+        print("open-claude: 'claude' not on PATH — opening shells instead "
+              "(install Claude Code to get consoles)", file=sys.stderr)
+    cmds = {"claude": shlex.quote(claude_bin), "term": shlex.quote(shell_bin)}
+    dock_cmd = _dock_command(scene)
+
+    # Narrow-terminal guard: never carve unusable slivers. n=1 does no
+    # splitting, so it always proceeds (same as `side claude`).
+    cols, rows = _screen_size()
+    if n >= 2:
+        per_col = (cols - WIDTH) // 2
+        if per_col < MIN_CONSOLE_COLS:
+            sys.exit(f"open-claude: terminal too narrow for {n} panes — each "
+                     f"column would be ~{per_col} cols beside the {WIDTH}-col "
+                     f"dock (need >= {MIN_CONSOLE_COLS}). Widen the window or "
+                     f"use a smaller n.")
+    if n >= 3 and rows // 2 < MIN_CONSOLE_ROWS:
+        sys.exit(f"open-claude: terminal too short for {n} panes — each row "
+                 f"would be ~{rows // 2} rows (need >= {MIN_CONSOLE_ROWS}).")
+
+    if os.environ.get("TMUX"):
+        # Already in tmux: dock the monitor right, build the grid in this window,
+        # run claude #1 here so its lifetime governs the rest (like `side`).
+        dock = subprocess.run(
+            ["tmux", "split-window", "-h", "-l", str(WIDTH), "-d",
+             "-P", "-F", "#{pane_id}", dock_cmd],
+            check=True, capture_output=True, text=True).stdout.strip()
+        c1 = subprocess.run(["tmux", "display-message", "-p", "#{pane_id}"],
+                            capture_output=True, text=True).stdout.strip()
+        extra = _split_grid(n, c1, cmds)
+        subprocess.run(["tmux", "resize-pane", "-t", dock, "-x", str(WIDTH)],
+                       stderr=subprocess.DEVNULL)
+        rc = subprocess.call([claude_bin])           # claude #1 in this pane
+        for pid in extra + [dock]:
+            subprocess.run(["tmux", "kill-pane", "-t", pid],
+                           stderr=subprocess.DEVNULL)
+        sys.exit(rc)
+
+    # Outside tmux: build a fresh session sized to the real terminal so the
+    # dock keeps its 44 cols, then attach. Claude #1 carries `kill-session`,
+    # so quitting it tears the whole session (dock + other panes) down.
+    info = subprocess.run(
+        ["tmux", "new-session", "-d", "-x", str(cols), "-y", str(rows),
+         "-P", "-F", "#{session_name} #{pane_id}",
+         f"{cmds['claude']}; tmux kill-session"],
+        check=True, capture_output=True, text=True).stdout.split()
+    sess, c1 = info[0], info[1]
+    dock = subprocess.run(
+        ["tmux", "split-window", "-h", "-l", str(WIDTH), "-d", "-t", c1,
+         "-P", "-F", "#{pane_id}", dock_cmd],
+        check=True, capture_output=True, text=True).stdout.strip()
+    _split_grid(n, c1, cmds)
+    subprocess.run(["tmux", "resize-pane", "-t", dock, "-x", str(WIDTH)],
+                   stderr=subprocess.DEVNULL)
+    subprocess.run(["tmux", "set-option", "-t", sess, "mouse", "on"])
+    os.execvp("tmux", ["tmux", "attach-session", "-t", sess])
 
 
 def run_window(scene):
@@ -2832,6 +2985,24 @@ def main():
         except (IndexError, ValueError):
             sys.exit("--fps needs a number (5-60)")
         del argv[i:i + 2]
+    if os.path.basename(sys.argv[0]) == "open-claude":
+        if argv and argv[0] in ("-h", "--help"):
+            print("usage: open-claude [n]   monitor dock + n panes (claude + terminals)\n"
+                  "  n = 1..4 (default 1): 1 claude / claude+terminal /\n"
+                  "  2 claude over 1 terminal / 2 claude over 2 terminals.\n"
+                  "  --scene, --fps tune the dock.")
+            return
+        n = 1
+        if argv:
+            try:
+                n = int(argv[0])
+            except ValueError:
+                sys.exit(f"open-claude: count must be a number 1-4 "
+                         f"(got {argv[0]!r})")
+            if not 1 <= n <= 4:
+                sys.exit(f"open-claude: count must be between 1 and 4 (got {n})")
+        open_claude(n, scene)
+        return
     if argv and argv[0] in ("-h", "--help"):
         print(__doc__.strip())
     elif argv and argv[0] == "--once":

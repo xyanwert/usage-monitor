@@ -66,7 +66,11 @@ git clone https://github.com/xyanwert/usage-monitor.git
 cd usage-monitor
 chmod +x claude_monitor.py
 ln -s "$PWD/claude_monitor.py" ~/.local/bin/claude-monitor   # if ~/.local/bin is on your PATH
+ln -s "$PWD/claude_monitor.py" ~/.local/bin/open-claude       # enables `open-claude [n]`
 ```
+
+The second symlink installs `open-claude`: the same script, but launched under
+that name it opens the dock plus a grid of Claude consoles (see Run).
 
 Requirements: Python 3.8+, a truecolor terminal, and a logged-in
 [Claude Code](https://claude.com/claude-code) (that's where the OAuth token
@@ -78,6 +82,9 @@ installs it for you.
 ```bash
 claude-monitor                   # full-window monitor
 claude-monitor side claude       # the good stuff: claude left, fire right
+open-claude                      # dock + one claude console (same as `side claude`)
+open-claude 2                    # dock right, claude + a terminal side by side
+open-claude 4                    # dock right, 2 claude over 2 terminals (2x2)
 claude-monitor --scene invaders  # pick your poison: fire | tokens | invaders | cube
 claude-monitor --once            # print usage once and exit
 ```
@@ -85,6 +92,18 @@ claude-monitor --once            # print usage once and exit
 `side` splits the terminal with tmux (44-col dock on the right), ties the
 lifetimes together (quit claude and the dock goes too), and turns on mouse
 mode — click a pane to focus it.
+
+`open-claude [n]` is the multi-pane version: the same 44-col dock on the
+right, and `n` panes (1–4, default 1) tiled in the rest — a mix of Claude
+consoles and plain terminals, with Claude filling the top row:
+**1** one Claude · **2** Claude + a terminal (two columns) · **3** two Claude
+on top, a full-width terminal below · **4** two Claude on top, two terminals
+below (2×2). It reuses `side`'s dock, mouse mode, and lifetime coupling:
+quitting the **first** Claude console tears the whole layout down (closing any
+other pane just closes that pane). It refuses to split if the terminal is too
+narrow for usable panes. Note `open-claude 4` starts **two** Claude sessions at
+once — they both draw on the same plan limits, which is exactly what the dock
+is there to show you. (`--scene`/`--fps` tune the dock as usual.)
 
 Inside tmux the dock runs full truecolor at full frame rate, same as a plain
 window. (It only eases off if a write genuinely backs up — a safety net that
