@@ -13,7 +13,11 @@ Press `s` to cycle. All three are driven by the same live data.
 
 **🔥 BURNOUT (fire)** — a Doom-fire that grows with your session usage and
 gusts when claude is actively working. Hit the limit and it burns out: ash,
-smoke, pulsing embers, and a countdown — then it reignites on reset.
+smoke, pulsing embers, and a countdown — then it reignites on reset. The flame
+recolors to match the session: **forest-green** when the model is Fable, and
+**electric violet** during an ultracode dynamic workflow (a recent `Workflow`
+tool call, an effort literally set to `ultracode`, or `BURNOUT_ULTRA=1`). Plain
+`xhigh` effort stays the normal red.
 
 **⌨ TOKENFALL** — a prompt line "generates" text (cliché AI included), each
 line tokenizes into colored pills, and the tokens fly up into the context

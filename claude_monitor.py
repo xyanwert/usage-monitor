@@ -221,9 +221,24 @@ def _pretty_model(mid):
     return out.strip() or mid
 
 
+WORKFLOW_WINDOW = 900.0          # a Workflow tool call this recent == "active"
+
+
+def _iso_age(core):
+    """Seconds since an ISO-8601 UTC timestamp core 'YYYY-MM-DDTHH:MM:SS'."""
+    import calendar
+    try:
+        return time.time() - calendar.timegm(
+            time.strptime(core[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 1e9
+
+
 def _scan_transcript_tail(path, span=131072):
-    """Last assistant model + last /effort override from a session transcript."""
+    """Last assistant model, last /effort override, and whether a Workflow tool
+    call fired recently (the dynamic-workflow / ultracode tell)."""
     model = effort = None
+    workflow = False
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -241,11 +256,15 @@ def _scan_transcript_tail(path, span=131072):
                 m = re.search(rb"Set effort level to (\w+)", raw)
                 if m:
                     effort = m.group(1).decode()
-            if model and effort:
+            if not workflow and b'"name":"Workflow"' in raw:
+                m = re.search(rb'"timestamp":"([0-9T:-]+)', raw)
+                if m and _iso_age(m.group(1).decode()) < WORKFLOW_WINDOW:
+                    workflow = True
+            if model and effort and workflow:
                 break
     except Exception:
         pass
-    return model, effort
+    return model, effort, workflow
 
 
 def claude_session_info():
@@ -270,10 +289,11 @@ def claude_session_info():
         s = max(cands)[3]
         info = {"status": s.get("status", ""), "name": s.get("name") or ""}
         model = effort = None
+        workflow = False
         cwd, sid = s.get("cwd"), s.get("sessionId")
         if cwd and sid:
             slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)
-            model, effort = _scan_transcript_tail(
+            model, effort, workflow = _scan_transcript_tail(
                 os.path.join(PROJ_DIR, slug, sid + ".jsonl"))
         if effort is None:
             try:
@@ -285,6 +305,8 @@ def claude_session_info():
             info["model"] = _pretty_model(model)
         if effort:
             info["effort"] = effort
+        if workflow:
+            info["workflow"] = True
         return info
     except Exception:
         return None
@@ -552,6 +574,15 @@ VIOLET_PALETTE = _ramp(
     [(0.00, (3, 2, 5)), (0.18, (16, 4, 32)), (0.37, (62, 12, 120)),
      (0.55, (122, 26, 212)), (0.71, (194, 52, 247)),
      (0.84, (242, 118, 254)), (0.93, (252, 212, 255)),
+     (1.00, (255, 255, 255))], len(PALETTE))
+
+# Fable tell: the fire burns a lush forest-fantasy green instead of doom red
+# (deep pine shadow -> dark forest -> emerald -> vivid faerie green -> luminous
+# leaf -> white-hot). Emerald mids lean faintly teal for the "enchanted" glow.
+GREEN_PALETTE = _ramp(
+    [(0.00, (2, 6, 3)), (0.16, (6, 28, 13)), (0.34, (14, 74, 32)),
+     (0.52, (22, 140, 78)), (0.68, (46, 196, 92)),
+     (0.82, (124, 234, 120)), (0.92, (202, 252, 184)),
      (1.00, (255, 255, 255))], len(PALETTE))
 
 
@@ -2018,6 +2049,7 @@ class Monitor:
         self.coins = []               # token-coins melting into the flames
         self._coin_acc = 0.0
         self.ultra = False            # claude on ultracode -> violet flame
+        self.fable = False            # claude model = Fable -> forest-green flame
         self.prev_pct = None
 
     def resize(self, fire_rows):
@@ -2250,7 +2282,8 @@ class Monitor:
 
     def pixels(self):
         H, W = self.fire.h, WIDTH
-        pal = VIOLET_PALETTE if self.ultra else PALETTE
+        pal = (VIOLET_PALETTE if self.ultra
+               else GREEN_PALETTE if self.fable else PALETTE)
         buf = [[pal[v] for v in row] for row in self.fire.cells]
 
         if self.mound and self.state in ("ash", "reignite"):
@@ -2260,10 +2293,15 @@ class Monitor:
                     buf[H - 1 - dy][x] = (g + 10, g, g - 4)
             for (ex, depth, phase) in self.embers:
                 s = (math.sin(self.t * 2.2 + phase) + 1) / 2
-                buf[H - 1 - depth][ex] = (
-                    (int(32 + 144 * s), int(12 + 48 * s), int(58 + 172 * s))
-                    if self.ultra
-                    else (int(60 + 160 * s), int(20 + 70 * s), 10))
+                if self.ultra:
+                    buf[H - 1 - depth][ex] = (
+                        int(32 + 144 * s), int(12 + 48 * s), int(58 + 172 * s))
+                elif self.fable:
+                    buf[H - 1 - depth][ex] = (
+                        int(18 + 70 * s), int(58 + 168 * s), int(26 + 66 * s))
+                else:
+                    buf[H - 1 - depth][ex] = (
+                        int(60 + 160 * s), int(20 + 70 * s), 10)
 
         for p in self.smoke:
             x, y = int(p[0]), int(p[1])
@@ -2271,7 +2309,9 @@ class Monitor:
                 g = int(30 + 80 * (1 - p[3] / p[4]))
                 buf[y][x] = (g, g, g + 6)
 
-        spark_col = (248, 224, 255) if self.ultra else (255, 235, 170)
+        spark_col = ((248, 224, 255) if self.ultra
+                     else (206, 255, 190) if self.fable
+                     else (255, 235, 170))
         for s in self.sparks:
             x, y = int(s[0]), int(s[1])
             if 0 <= x < W and 0 <= y < H:
@@ -2660,9 +2700,15 @@ def run_tui(check=False, scene="fire", dock=False):
                 sess = claude_session_info()
                 sess_next = time.monotonic() + 2.0
             busy = bool(sess and sess.get("status") == "busy")
-            # ultracode effort -> the fire burns violet
+            # Violet flame = a dynamic-workflow / ultracode session (NOT merely
+            # xhigh effort): a recent Workflow tool call, an effort literally set
+            # to ultracode, or an explicit BURNOUT_ULTRA=1 opt-in.
             eff = ((sess or {}).get("effort") or "").lower()
-            fire.ultra = eff in ("ultracode", "xhigh", "ultra")
+            fire.ultra = (bool(os.environ.get("BURNOUT_ULTRA"))
+                          or eff in ("ultracode", "ultra")
+                          or bool((sess or {}).get("workflow")))
+            # Forest-green flame when the running model is Fable.
+            fire.fable = "fable" in ((sess or {}).get("model") or "").lower()
             mon.update(gauges, rate, busy)
             frame_out = render(mon, gauges, plan, age, error, rate, sess)
             # row-diff: resend only the rows that changed since last frame, so
